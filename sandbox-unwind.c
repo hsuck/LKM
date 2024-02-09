@@ -148,8 +148,8 @@ static unsigned long translate_kern_to_user(unsigned long, unsigned long,
 					    unsigned long);
 static inline unsigned int extract32(unsigned int, int, int);
 static inline int sextract32(unsigned int, int, int);
-static table_t *_find_table(const struct hash_table *, unsigned long);
-static table_t *find_table(struct hash_table *, struct unwind_frame_info *);
+static const table_t *_find_table(const struct hash_table *, unsigned long);
+static const table_t *find_table(struct hash_table *, struct unwind_frame_info *);
 
 /* extern int traverse_vma(unsigned long pc); */
 /* extern int delta_app_inlist(struct task_struct *tsk); */
@@ -191,11 +191,11 @@ EXPORT_SYMBOL(unwind_add_table);
  * FIXME ztex: now we always return the root table,
  * but we need to find the right table given the pc
  */
-static table_t *_find_table(const struct hash_table *phtable,
+static const table_t *_find_table(const struct hash_table *phtable,
 			   const unsigned long pc)
 {
 	int found = 0;
-	table_t *ptable = phtable->root_table;
+	const table_t *ptable = phtable->root_table;
 
 	if (!ptable)
 		return NULL;
@@ -223,12 +223,12 @@ static table_t *_find_table(const struct hash_table *phtable,
 		return NULL;
 }
 
-static table_t *find_table(struct hash_table *phtable,
+static const table_t *find_table(struct hash_table *phtable,
 			   struct unwind_frame_info *frame)
 {
 	kallsyms_lookup_name_t kallsyms_lookup_name;
 	int retval;
-	table_t *table;
+	const table_t *table;
 
 	register_kprobe(&kp);
 	kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
@@ -637,6 +637,8 @@ static void _init_unwind_table(struct hash_table *phtable, struct so_info *cur,
 		goto ret_err;
 	}
 
+	pr_info("[hsuck] Initializing the table of %s\n", cur->name);
+
 	do {
 		pr_info("[vicky] table name: %s, cur name:%s\n",
 			 table->info->name, cur->name);
@@ -735,14 +737,16 @@ first:
 
 	sort(header->table, n, sizeof(*header->table),
 	     cmp_eh_frame_hdr_table_entries, swap_eh_frame_hdr_table_entries);
-	smp_wmb();
 	table->hdrsz = hdrSize;
+	smp_wmb();
 	table->header = (const void *)header;
 	get_task_comm(table->name, frame->task);
 
 /* #if DEBUG_SANDBOX == 2 */
 	if (!strcmp("mod_unixd.so", cur->name) /*||
 	    !strcmp("mod_mime.so", table->info->name)*/) {
+		pr_info("[hsuck] kern base: %#0lx, user base: %#0lx\n",
+			table_start, user_base);
 		for (int i = 0; i < n; ++i) {
 			pr_info("[ztex] FDE: start: %lx, fde: %lx\n",
 				translate_kern_to_user(
@@ -755,7 +759,7 @@ first:
 	}
 /* #endif */
 inited:
-	pr_debug("[ztex] parsing .eh_frame sucessful\n");
+	pr_info("[ztex] parsing .eh_frame sucessful\n");
 	return;
 ret_err:
 	pr_err("[ztex] failed to process .eh_frame\n");
@@ -768,7 +772,7 @@ void init_unwind_table(struct hash_table *phtable,
 	struct so_info *cur;
 
 	if (!phtable || hash_empty(phtable->htable)) {
-		pr_debug("[hsuck] %s, L%d: hash table not found or no entries\n",
+		pr_err("[hsuck] %s, L%d: hash table not found or no entries\n",
 			 __FUNCTION__, __LINE__);
 		return;
 	}
@@ -778,8 +782,6 @@ void init_unwind_table(struct hash_table *phtable,
 		return;
 
 	hash_for_each (phtable->htable, bkt, cur, node) {
-		pr_info("[hsuck] Initializing the table of %s\n",
-			cur->name);
 		_init_unwind_table(phtable, cur, frame);
 	}
 
@@ -1118,6 +1120,17 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 		fde_count);
 
 	temp_ptr = (struct eh_frame_hdr_table_entry *)ptr;
+	if (!strcmp("mod_unixd.so", table->info->name))
+		for (int i = 0; i < fde_count; i++) {
+			pr_info("[vicky] (user) %d: startLoc = %lx, fde = %lx\n",
+				i,
+				translate_kern_to_user(kern_base, user_base,
+						       temp_ptr[i].start),
+				translate_kern_to_user(kern_base, user_base,
+						       temp_ptr[i].fde));
+			pr_info("[vicky] (kern) %d: startLoc = %lx, fde = %lx\n",
+				i, temp_ptr[i].start, temp_ptr[i].fde);
+		}
 #if DEBUG_SANDBOX == 2
 	for (int i = 0; i < fde_count; i++) {
 		if (i % 100 == 0) {
@@ -1173,17 +1186,19 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 			pr_err("[vicky] failed at [%s]: %d, "
 			       "error startLoc = %lx, correct startLoc = %lx\n",
 			       __FUNCTION__, __LINE__, temp, startLoc);
+			pr_info("[hsuck] kern base: %#0lx, user base: %#0lx\n",
+				kern_base, user_base);
 			for (int i = 0; i < fde_count; i++) {
-				if (i % 1 == 0) {
-					pr_info("[vicky] (user) %d: startLoc = %lx, fde = %lx\n",
-						i,
-						translate_kern_to_user(kern_base, user_base,
-								       temp_ptr[i].start),
-						translate_kern_to_user(kern_base, user_base,
-								       temp_ptr[i].fde));
-					pr_info("[vicky] (kern) %d: startLoc = %lx, fde = %lx\n",
-						i, temp_ptr[i].start, temp_ptr[i].fde);
-				}
+				pr_info("[vicky] (user) %d: startLoc = %lx, fde = %lx\n",
+					i,
+					translate_kern_to_user(
+						kern_base, user_base,
+						temp_ptr[i].start),
+					translate_kern_to_user(
+						kern_base, user_base,
+						temp_ptr[i].fde));
+				pr_info("[vicky] (kern) %d: startLoc = %lx, fde = %lx\n",
+					i, temp_ptr[i].start, temp_ptr[i].fde);
 			}
 		} else {
 			if (!(ptrType & DW_EH_PE_indirect))
@@ -1199,17 +1214,20 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 				       __FUNCTION__, __LINE__, startLoc,
 				       pc_kern, endLoc, kern_base,
 				       phtable->elf_entry);
+				pr_info("[hsuck] kern base: %#0lx, user base: %#0lx\n",
+					kern_base, user_base);
 				for (int i = 0; i < fde_count; i++) {
-					if (i % 1 == 0) {
-						pr_info("[vicky] (user) %d: startLoc = %lx, fde = %lx\n",
-							i,
-							translate_kern_to_user(kern_base, user_base,
-									       temp_ptr[i].start),
-							translate_kern_to_user(kern_base, user_base,
-									       temp_ptr[i].fde));
-						pr_info("[vicky] (kern) %d: startLoc = %lx, fde = %lx\n",
-							i, temp_ptr[i].start, temp_ptr[i].fde);
-					}
+					pr_info("[vicky] (user) %d: startLoc = %lx, fde = %lx\n",
+						i,
+						translate_kern_to_user(
+							kern_base, user_base,
+							temp_ptr[i].start),
+						translate_kern_to_user(
+							kern_base, user_base,
+							temp_ptr[i].fde));
+					pr_info("[vicky] (kern) %d: startLoc = %lx, fde = %lx\n",
+						i, temp_ptr[i].start,
+						temp_ptr[i].fde);
 				}
 				fde = NULL;
 				cie = NULL;
@@ -2062,6 +2080,7 @@ int delta_enforce_verification(struct hash_table *phtable,
 	kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
 	unregister_kprobe(&kp);
 	delta_app_inlist = (void *)kallsyms_lookup_name("delta_app_inlist");	
+
 	/* Unwinding until reach main() */
 	while (1) {
 		retval = delta_unwind(phtable, frame);

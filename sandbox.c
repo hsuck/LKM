@@ -159,7 +159,7 @@ static void unwind_stack(void)
 
 	pr_debug("[hsuck] fetching .eh_frame of %s\n", current->comm);
 	if (proc_info->eh_frame_found != 1) {
-		pr_debug("[ztex] we did not find .eh_frame section previously\n");
+		pr_err("[ztex] we did not find .eh_frame section previously\n");
 		goto out;
 	}
 
@@ -222,14 +222,10 @@ unwinding:
 	/* } */
 
 out:
-	if (frame) {
-		kfree(frame);
-		frame = NULL;
-	}
+	RELEASE_MEMORY(frame);
 	return;
 out_free_ehf:
-	kfree(proc_info->ehframe);
-	proc_info->ehframe = NULL;
+	RELEASE_MEMORY(proc_info->ehframe);
 }
 
 static void fill_base(const char *libname, unsigned long base_address,
@@ -571,7 +567,7 @@ int insert_item(struct hash_table *phtable, const char *soname)
 
 	item = kmalloc(sizeof(struct so_info), GFP_KERNEL);
 	if (!item) {
-		pr_err("[hsuck] %s:%d buffer allocation failed\n", __FUNCTION__,
+		pr_err("[hsuck] %s, %d: buffer allocation failed\n", __FUNCTION__,
 		       __LINE__);
 		goto out;
 	}
@@ -579,7 +575,7 @@ int insert_item(struct hash_table *phtable, const char *soname)
 
 	item->name = kmalloc(strlen(soname) + 1, GFP_KERNEL);
 	if (!item->name) {
-		pr_err("[hsuck] %s:%d buffer allocation failed\n", __FUNCTION__,
+		pr_err("[hsuck] %s, %d: buffer allocation failed\n", __FUNCTION__,
 		       __LINE__);
 		goto out_free_item;
 	}
@@ -624,6 +620,7 @@ static void syscall_protection(void)
 {
 	int retval;
 	struct pt_regs *regs;
+
 	/* int bkt; */
 	/* struct hash_table *phtable = NULL; */
 	/* struct so_info *cur; */
@@ -655,7 +652,10 @@ static void syscall_protection(void)
 	/* 	hash_for_each (phtable->htable, bkt, cur, node) { */
 	/* 		pr_info("[hsuck] %s[%#0lx-%#0lx]\n", cur->name, */
 	/* 			cur->base_address, cur->base_address + cur->pc_range); */
+	/* 		pr_info("\t.eh_frame start: %#0lx, size: %#0lx\n", */
+	/* 			cur->eh_frame_start, cur->eh_frame_size); */
 	/* 	} */
+	/* 	pr_info("========================================================\n"); */
 	/* } */
 
 	regs = task_pt_regs(current);
@@ -676,7 +676,6 @@ static void syscall_protection(void)
 	unwind_stack();
 out:
 #if DEBUG_SANDBOX > 0
-	/* dump_text(); */
 	/* dump_ehframe(); */
 #endif
 	return;
@@ -762,16 +761,15 @@ static char *elf_fetch_tab(struct file *elf_file, struct elf_shdr *elf_shtab)
 
 	tab = kmalloc(size, GFP_KERNEL);
 	if (!tab) {
-		pr_err("[hsuck] fucking ass\n");
+		pr_err("[hsuck] %s, %d: fucking ass\n", __FUNCTION__, __LINE__);
 		goto out;
 	}
-	memset(tab, 0, size);
 	pr_debug("[hsuck] %s: size: %u, offset: %llu\n", __FUNCTION__, size,
 		 (unsigned long long)elf_shtab->sh_offset);
 	retval = elf_read(elf_file, tab, size, elf_shtab->sh_offset);
 out:
 	if (retval) {
-		pr_err("[hsuck] fucking ass\n");
+		pr_err("[hsuck] %s, %d: fucking ass\n", __FUNCTION__, __LINE__);
 		kfree(tab);
 		tab = NULL;
 	}
@@ -854,7 +852,7 @@ static char *_lib_fetch_ehframe(struct file *file, struct so_info *cur,
 	shstrtab = elf_fetch_tab(file, elf_shstrtab);
 	if (!shstrtab) {
 		pr_err("[ztex] fail to find the string table\n");
-		goto out_free_shstrtab;
+		goto out_free_shdata;
 	}
 
 	elf_shent = elf_shdata;
@@ -897,31 +895,13 @@ static char *_lib_fetch_ehframe(struct file *file, struct so_info *cur,
 			continue;
 		}
 	}
-
 	elf_get_so(elf_shdynamic, dynamic, dynstr, phtable);
 
-	if (shstrtab) {
-		kfree(shstrtab);
-		shstrtab = NULL;
-	}
-	if (dynstr) {
-		kfree(dynstr);
-		dynstr = NULL;
-	}
-	if (dynamic) {
-		kfree(dynamic);
-		dynamic = NULL;
-	}
-out_free_shstrtab:
-	if (elf_shstrtab) {
-		kfree(elf_shstrtab);
-		elf_shstrtab = NULL;
-	}
+	RELEASE_MEMORY(shstrtab);
+	RELEASE_MEMORY(dynstr);
+	RELEASE_MEMORY(dynamic);
 out_free_shdata:
-	if (elf_shdata) {
-		kfree(elf_shdata);
-		elf_shdata = NULL;
-	}
+	RELEASE_MEMORY(elf_shdata);
 out:
 	return ehframe;
 }
@@ -1045,8 +1025,15 @@ asmlinkage long hacked_openat(const struct pt_regs *pt_regs)
 asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 {
 	char filepath[0x100];
+	char *dynamic = NULL;
+	char *dynstr = NULL;
 	char *shstrtab = NULL;
+	char *strtab = NULL;
+	char *symtab = NULL;
+	Elf64_Sym *sym = NULL;
 	int retval;
+	struct elf_shdr *elf_shdynamic = NULL;
+	struct elf_shdr *elf_shsymtab = NULL;
 	struct elf_shdr *elf_shdata, *elf_shent, *elf_shstrtab;
 	struct elfhdr elf_ex;
 	struct file *file;
@@ -1054,14 +1041,6 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 	struct so_info *proc_info;
 	unsigned int i;
 	unsigned long long filename = pt_regs->user_regs.regs[0];
-
-	char *dynamic = NULL;
-	char *dynstr = NULL;
-	char *strtab = NULL;
-	char *symtab = NULL;
-	Elf64_Sym *sym = NULL;
-	struct elf_shdr *elf_shdynamic = NULL;
-	struct elf_shdr *elf_shsymtab = NULL;
 
 	/* Get file path from x0 register */
 	if (copy_from_user(filepath, (void __user *)filename, 0x100)) {
@@ -1075,6 +1054,8 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 	if (strcmp(hook_app2, kbasename(filepath)) != 0)
 		goto out;
 
+	pr_info("[vicky] syscall `execve` is hooked\n");
+
 	/* Open file */
 	file = filp_open(filepath, O_RDONLY | O_LARGEFILE, 0);
 	if (IS_ERR(file)) {
@@ -1117,12 +1098,12 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 	shstrtab = elf_fetch_tab(file, elf_shstrtab);
 	if (!shstrtab) {
 		pr_err("[ztex] fail to find the string table\n");
-		goto out_free_shstrtab;
+		goto out_free_shdata;
 	}
 
 	/* Create a hash table for the elf binary */
 	if (create_htable(kbasename(filepath), task_pid_nr(current), true) == -1) {
-		pr_info("[hsuck] %s, L%d: fuck\n", __FUNCTION__, __LINE__);
+		pr_err("[hsuck] %s, L%d: fuck\n", __FUNCTION__, __LINE__);
 		goto out_free_strtab;
 	}
 	if (!(htable = search_htable(kbasename(filepath),
@@ -1139,9 +1120,9 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 	elf_shent = elf_shdata;
 	for (i = 0; i < elf_ex.e_shnum; i++, elf_shent++) {
 		if (strcmp(".eh_frame", shstrtab + elf_shent->sh_name) == 0) {
-			pr_debug("[ztex] found .eh_frame in %s\n",
+			pr_info("[ztex] found .eh_frame in %s\n",
 				kbasename(filepath));
-			pr_debug("[hsuck] start: %#0llx, size: %#0llx\n",
+			pr_info("[hsuck] start: %#0llx, size: %#0llx\n",
 				 elf_shent->sh_addr, elf_shent->sh_size);
 			proc_info->eh_frame_start = elf_shent->sh_addr;
 			proc_info->eh_frame_size = elf_shent->sh_size;
@@ -1149,9 +1130,9 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 			continue;
 		}
 		if (strcmp(".plt", shstrtab + elf_shent->sh_name) == 0) {
-			pr_debug("[ztex] found .plt in %s\n",
+			pr_info("[ztex] found .plt in %s\n",
 				kbasename(filepath));
-			pr_debug("[hsuck] start: %#0llx, size: %#0llx\n",
+			pr_info("[hsuck] start: %#0llx, size: %#0llx\n",
 				 elf_shent->sh_addr, elf_shent->sh_size);
 			proc_info->plt_start = elf_shent->sh_addr;
 			proc_info->plt_size = elf_shent->sh_size;
@@ -1161,20 +1142,20 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 		if (strcmp(".strtab", shstrtab + elf_shent->sh_name) == 0) {
 			strtab = elf_fetch_tab(file, elf_shent);
 			if (!strtab) {
-				pr_err("[ztex] cannot found strtab in %s\n",
+				pr_err("[ztex] cannot found .strtab in %s\n",
 				       kbasename(filepath));
 			}
-			pr_debug("[hsuck] found .strtab in %s\n",
+			pr_info("[hsuck] found .strtab in %s\n",
 				kbasename(filepath));
 			continue;
 		}
 		if (strcmp(".symtab", shstrtab + elf_shent->sh_name) == 0) {
 			symtab = elf_fetch_tab(file, elf_shent);
 			if (!symtab) {
-				pr_err("[ztex] cannot found symtab in %s\n",
+				pr_err("[ztex] cannot found .symtab in %s\n",
 				       kbasename(filepath));
 			}
-			pr_debug("[ztex] found .symtab in %s\n",
+			pr_info("[ztex] found .symtab in %s\n",
 				kbasename(filepath));
 			elf_shsymtab = elf_shent;
 			continue;
@@ -1185,7 +1166,7 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 				pr_err("[hsuck] cannot found dynstr in %s\n",
 				       kbasename(filepath));
 			}
-			pr_debug("[hsuck] found .dynstr in %s\n",
+			pr_info("[hsuck] found .dynstr in %s\n",
 				kbasename(filepath));
 			continue;
 		}
@@ -1195,7 +1176,7 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 				pr_err("[hsuck] cannot found dynamic in %s\n",
 				       kbasename(filepath));
 			}
-			pr_debug("[hsuck] found .dynamic in %s\n",
+			pr_info("[hsuck] found .dynamic in %s\n",
 				kbasename(filepath));
 			elf_shdynamic = elf_shent;
 			continue;
@@ -1204,61 +1185,45 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 
 	sym = elf_get_funcsym(elf_shsymtab, symtab, strtab, TERMINATE_FUNCTION);
 	if (!sym) {
-		/* pr_err("[ztex] fail to find the symbol of the terminate function, " TERMINATE_FUNCTION */
-		/*        "\n"); */
+		pr_err("[ztex] fail to find the symbol of the terminate function,"
+		       TERMINATE_FUNCTION "\n");
 		htable->elf_entry_found = 0;
 		goto out_free_tabs;
 	}
-	elf_get_so(elf_shdynamic, dynamic, dynstr, htable);
 	htable->elf_entry_found = 1;
 	htable->elf_entry = sym->st_value;
-	pr_debug("[ztex] the terminate function address: 0x%lx\n",
-		 htable->elf_entry);
+	pr_info("[ztex] the terminate function address: 0x%lx\n", htable->elf_entry);
+
+	elf_get_so(elf_shdynamic, dynamic, dynstr, htable);
+
 out_free_tabs:
-	if (strtab) {
-		kfree(strtab);
-		strtab = NULL;
-	}
-	if (symtab) {
-		kfree(symtab);
-		symtab = NULL;
-	}
-	if (dynstr) {
-		kfree(dynstr);
-		dynstr = NULL;
-	}
-	if (dynamic) {
-		kfree(dynamic);
-		dynamic = NULL;
-	}
+	RELEASE_MEMORY(strtab);
+	RELEASE_MEMORY(symtab);
+	RELEASE_MEMORY(dynstr);
+	RELEASE_MEMORY(dynamic);
 out_free_strtab:
-	if (shstrtab) {
-		kfree(shstrtab);
-		shstrtab = NULL;
-	}
-out_free_shstrtab:
-	if (elf_shstrtab) {
-		kfree(elf_shstrtab);
-		elf_shstrtab = NULL;
-	}
+	RELEASE_MEMORY(shstrtab);
 out_free_shdata:
-	if (elf_shdata) {
-		kfree(elf_shdata);
-		elf_shdata = NULL;
-	}
-out:
-	if (delta_app_inlist(current)) {
-		pr_debug("[vicky] syscall `execve` is hooked\n");
+	RELEASE_MEMORY(elf_shdata);
+
+	if (delta_app_inlist(current))
 		syscall_protection();
-	}
+out:
 	return orig_execve(pt_regs);
 }
 
 asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 {
 	char filepath[0x100];
+	char *dynamic = NULL;
+	char *dynstr = NULL;
 	char *shstrtab = NULL;
+	char *strtab = NULL;
+	char *symtab = NULL;
+	Elf64_Sym *sym = NULL;
 	int retval;
+	struct elf_shdr *elf_shdynamic = NULL;
+	struct elf_shdr *elf_shsymtab = NULL;
 	struct elf_shdr *elf_shdata, *elf_shent, *elf_shstrtab;
 	struct elfhdr elf_ex;
 	struct file *file;
@@ -1267,14 +1232,6 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 	unsigned int i;
 	unsigned long long filename = pt_regs->user_regs.regs[0];
 
-	char *dynamic = NULL;
-	char *dynstr = NULL;
-	char *strtab = NULL;
-	char *symtab = NULL;
-	Elf64_Sym *sym = NULL;
-	struct elf_shdr *elf_shdynamic = NULL;
-	struct elf_shdr *elf_shsymtab = NULL;
-
 	/* Get file path from x0 register */
 	if (copy_from_user(filepath, (void __user *)filename, 0x100)) {
 		pr_err("[hsuck] %s, L%d: failed to read from user space, "
@@ -1282,7 +1239,12 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 		       __FUNCTION__, __LINE__, filename);
 		goto out;
 	}
-	pr_debug("[hsuck] filename: %s\n", filepath);
+	pr_info("[hsuck] filename: %s\n", filepath);
+
+	if (strcmp(hook_app2, kbasename(filepath)) != 0)
+		goto out;
+
+	pr_info("[vicky] syscall `execve` is hooked\n");
 
 	/* Open file */
 	file = filp_open(filepath, O_RDONLY | O_LARGEFILE, 0);
@@ -1326,12 +1288,12 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 	shstrtab = elf_fetch_tab(file, elf_shstrtab);
 	if (!shstrtab) {
 		pr_err("[ztex] fail to find the string table\n");
-		goto out_free_shstrtab;
+		goto out_free_shdata;
 	}
 
 	/* Create a hash table for the elf binary */
-	if (create_htable(kbasename(filepath), task_pid_nr(current), true) < 0) {
-		pr_info("[hsuck] %s, L%d: fuck\n", __FUNCTION__, __LINE__);
+	if (create_htable(kbasename(filepath), task_pid_nr(current), true) == -1) {
+		pr_err("[hsuck] %s, L%d: fuck\n", __FUNCTION__, __LINE__);
 		goto out_free_strtab;
 	}
 	if (!(htable = search_htable(kbasename(filepath),
@@ -1348,9 +1310,9 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 	elf_shent = elf_shdata;
 	for (i = 0; i < elf_ex.e_shnum; i++, elf_shent++) {
 		if (strcmp(".eh_frame", shstrtab + elf_shent->sh_name) == 0) {
-			pr_debug("[ztex] found .eh_frame in %s\n",
+			pr_info("[ztex] found .eh_frame in %s\n",
 				kbasename(filepath));
-			pr_debug("[hsuck] start: %#0llx, size: %#0llx\n",
+			pr_info("[hsuck] start: %#0llx, size: %#0llx\n",
 				 elf_shent->sh_addr, elf_shent->sh_size);
 			proc_info->eh_frame_start = elf_shent->sh_addr;
 			proc_info->eh_frame_size = elf_shent->sh_size;
@@ -1358,9 +1320,9 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 			continue;
 		}
 		if (strcmp(".plt", shstrtab + elf_shent->sh_name) == 0) {
-			pr_debug("[ztex] found .plt in %s\n",
+			pr_info("[ztex] found .plt in %s\n",
 				kbasename(filepath));
-			pr_debug("[hsuck] start: %#0llx, size: %#0llx\n",
+			pr_info("[hsuck] start: %#0llx, size: %#0llx\n",
 				 elf_shent->sh_addr, elf_shent->sh_size);
 			proc_info->plt_start = elf_shent->sh_addr;
 			proc_info->plt_size = elf_shent->sh_size;
@@ -1370,20 +1332,20 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 		if (strcmp(".strtab", shstrtab + elf_shent->sh_name) == 0) {
 			strtab = elf_fetch_tab(file, elf_shent);
 			if (!strtab) {
-				pr_err("[ztex] cannot found strtab in %s\n",
+				pr_err("[ztex] cannot found .strtab in %s\n",
 				       kbasename(filepath));
 			}
-			pr_debug("[hsuck] found .strtab in %s\n",
+			pr_info("[hsuck] found .strtab in %s\n",
 				kbasename(filepath));
 			continue;
 		}
 		if (strcmp(".symtab", shstrtab + elf_shent->sh_name) == 0) {
 			symtab = elf_fetch_tab(file, elf_shent);
 			if (!symtab) {
-				pr_err("[ztex] cannot found symtab in %s\n",
+				pr_err("[ztex] cannot found .symtab in %s\n",
 				       kbasename(filepath));
 			}
-			pr_debug("[ztex] found .symtab in %s\n",
+			pr_info("[ztex] found .symtab in %s\n",
 				kbasename(filepath));
 			elf_shsymtab = elf_shent;
 			continue;
@@ -1394,7 +1356,7 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 				pr_err("[hsuck] cannot found dynstr in %s\n",
 				       kbasename(filepath));
 			}
-			pr_debug("[hsuck] found .dynstr in %s\n",
+			pr_info("[hsuck] found .dynstr in %s\n",
 				kbasename(filepath));
 			continue;
 		}
@@ -1404,7 +1366,7 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 				pr_err("[hsuck] cannot found dynamic in %s\n",
 				       kbasename(filepath));
 			}
-			pr_debug("[hsuck] found .dynamic in %s\n",
+			pr_info("[hsuck] found .dynamic in %s\n",
 				kbasename(filepath));
 			elf_shdynamic = elf_shent;
 			continue;
@@ -1413,53 +1375,30 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 
 	sym = elf_get_funcsym(elf_shsymtab, symtab, strtab, TERMINATE_FUNCTION);
 	if (!sym) {
-		/* pr_err("[ztex] fail to find the symbol of the terminate function, " TERMINATE_FUNCTION */
-		/*        "\n"); */
+		pr_err("[ztex] fail to find the symbol of the terminate function,"
+		       TERMINATE_FUNCTION "\n");
 		htable->elf_entry_found = 0;
 		goto out_free_tabs;
 	}
-	elf_get_so(elf_shdynamic, dynamic, dynstr, htable);
 	htable->elf_entry_found = 1;
 	htable->elf_entry = sym->st_value;
-	pr_debug("[ztex] the terminate function address: 0x%lx\n",
-		 htable->elf_entry);
+	pr_info("[ztex] the terminate function address: 0x%lx\n", htable->elf_entry);
+
+	elf_get_so(elf_shdynamic, dynamic, dynstr, htable);
+
 out_free_tabs:
-	if (strtab) {
-		kfree(strtab);
-		strtab = NULL;
-	}
-	if (symtab) {
-		kfree(symtab);
-		symtab = NULL;
-	}
-	if (dynstr) {
-		kfree(dynstr);
-		dynstr = NULL;
-	}
-	if (dynamic) {
-		kfree(dynamic);
-		dynamic = NULL;
-	}
+	RELEASE_MEMORY(strtab);
+	RELEASE_MEMORY(symtab);
+	RELEASE_MEMORY(dynstr);
+	RELEASE_MEMORY(dynamic);
 out_free_strtab:
-	if (shstrtab) {
-		kfree(shstrtab);
-		shstrtab = NULL;
-	}
-out_free_shstrtab:
-	if (elf_shstrtab) {
-		kfree(elf_shstrtab);
-		elf_shstrtab = NULL;
-	}
+	RELEASE_MEMORY(shstrtab);
 out_free_shdata:
-	if (elf_shdata) {
-		kfree(elf_shdata);
-		elf_shdata = NULL;
-	}
-out:	
-	if (delta_app_inlist(current)) {
-		pr_debug("[vicky] syscall `execveat` is hooked\n");
+	RELEASE_MEMORY(elf_shdata);
+
+	if (delta_app_inlist(current))
 		syscall_protection();
-	}
+out:
 	return orig_execveat(pt_regs);
 }
 
@@ -1551,7 +1490,7 @@ asmlinkage long hacked_clone(const struct pt_regs *pt_regs)
 
 		/* Create hash table for children */
 		if (create_htable(t->comm, retval, false) == -1) {
-			pr_info("[hsuck] %d: fuck", __LINE__);
+			pr_err("[hsuck] %d: fuck", __LINE__);
 			goto out;
 		}
 		if (!(cphtable = search_htable(t->comm, retval))) {

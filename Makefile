@@ -10,6 +10,7 @@ all:
 ins:
 	sudo insmod sandbox-unwind.ko
 	sudo insmod sandbox.ko
+	dmesg
 
 rm:
 	sudo rmmod sandbox sandbox-unwind
