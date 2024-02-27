@@ -24,8 +24,6 @@ void release_htable(const char *, const pid_t, int);
 struct so_info *search_item(struct hash_table *, const char *);
 int insert_item(struct hash_table *, const char *);
 
-/* void callback_ehframe(const void (*)(const char *, struct file *, */
-/* 				     struct hash_table *)); */
 
 static int elf_read(struct file *file, void *buf, size_t len, loff_t pos);
 static struct elf_shdr *load_elf_shdrs(const struct elfhdr *elf_ex,

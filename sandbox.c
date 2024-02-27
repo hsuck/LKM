@@ -43,19 +43,18 @@
 #define ELFOSABI_ARM_FDPIC 65 /* ARM FDPIC platform */
 #define elf_check_fdpic(x) ((x)->e_ident[EI_OSABI] == ELFOSABI_ARM_FDPIC)
 
-// #define HOOK_APP  "httpd"
-// #define HOOK_APP2 "test1"
-// #define HOOK_APP3 "netserver"
+#define CLONE_ENTRY 0xea5d0
+
 char hook_app[MAX_NAME]  = "test1";
 char hook_app2[MAX_NAME] = "httpd";
 char hook_app3[MAX_NAME] = "netserver";
-#define CLONE_ENTRY 0xea5d0
 
 typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 kallsyms_lookup_name_t __kallsyms_lookup_name;
+
 static int syscall_hooked = 0;
 static unsigned long *__sys_call_table;
-spinlock_t rootkit_lock;
+spinlock_t sandbox_lock;
 
 void (*update_mapping_prot)(phys_addr_t phys, unsigned long virt,
 			    phys_addr_t size, pgprot_t prot);
@@ -75,7 +74,7 @@ extern void deinit_unwind_table(struct hash_table *, int);
 extern int delta_enforce_verification(struct hash_table *,
 				      struct unwind_frame_info *);
 
-DECLARE_HASHTABLE(proc_htable, 8);
+DECLARE_HASHTABLE(proc_htable, 16);
 
 static struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
 
@@ -99,8 +98,8 @@ static void hexdump(char *buffer, unsigned long size)
 {
 	while (size >= 8) {
 		pr_debug("[ztex] %px: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-			buffer, buffer[0], buffer[1], buffer[2], buffer[3],
-			buffer[4], buffer[5], buffer[6], buffer[7]);
+			 buffer, buffer[0], buffer[1], buffer[2], buffer[3],
+			 buffer[4], buffer[5], buffer[6], buffer[7]);
 		buffer += 8;
 		size -= 8;
 	}
@@ -139,6 +138,7 @@ static void unwind_stack(void)
 	struct hash_table *phtable;
 	unsigned long addr, size;
 	int retval;
+	char *ehframe;
 
 	phtable = search_htable(current->comm, current->pid);
 	if (!phtable) {
@@ -167,20 +167,21 @@ static void unwind_stack(void)
 	size = proc_info->eh_frame_size;
 	pr_debug("[hsuck] .eh_frame: size=%lu, addr=%#0lx\n", size, addr);
 
-	proc_info->ehframe = kmalloc(size, GFP_KERNEL);
-	if (!proc_info->ehframe) {
+	ehframe = kmalloc(size, GFP_KERNEL);
+	if (!ehframe) {
 		pr_err("[hsuck] %s, L%d: buffer allocation failed\n", __FUNCTION__,
 		       __LINE__);
 		goto out;
 	}
-	memset(proc_info->ehframe, 0, size);
+	memset(ehframe, 0, size);
 
-	if (copy_from_user(proc_info->ehframe, (void __user *)addr, size)) {
+	if (copy_from_user(ehframe, (void __user *)addr, size)) {
 		pr_err("[hsuck] %s, L%d: failed to read from user space, "
 		       "addr: %lx, size: %lx\n",
 		       __FUNCTION__, __LINE__, addr, size);
 		goto out_free_ehf;
 	}
+	proc_info->ehframe = ehframe;
 
 unwind_table:
 	if (phtable->root_table)
@@ -221,11 +222,12 @@ unwinding:
 	/* 	do_exit(-1); */
 	/* } */
 
-out:
 	RELEASE_MEMORY(frame);
+out:
 	return;
 out_free_ehf:
-	RELEASE_MEMORY(proc_info->ehframe);
+	RELEASE_MEMORY(ehframe);
+	proc_info->ehframe = NULL;
 }
 
 static void fill_base(const char *libname, unsigned long base_address,
@@ -270,25 +272,6 @@ out:
 		 cur->pc_range);
 	return;
 }
-#if DEBUG_SANDBOX > 0
-static void dump_ehframe(void)
-{
-	struct pt_regs *regs;
-	unsigned long sp, pc, lr;
-	unsigned long elf_entry;
-	int syscall_no;
-
-	regs = task_pt_regs(current);
-	sp = regs->sp;
-	pc = regs->pc;
-	lr = regs->regs[30];
-	syscall_no = regs->syscallno;
-	pr_debug("[ztex] %s; syscallno: %d sp: %lx, pc: %lx, lr: %lx\n",
-		__FUNCTION__, syscall_no, sp, pc, lr);
-
-	return;
-}
-#endif // DEBUG_SANDBOX
 
 int traverse_vma(unsigned long pc)
 {
@@ -313,9 +296,9 @@ redo:
 	for (vma = __find_vma_prev(mm, mm->start_code, &prev); vma;
 	     vma = __find_vma_prev(mm, vma->vm_end, &prev)) {
 		if (vma->vm_file) {
-			char *buf = (char *)__get_free_page(GFP_NOWAIT);
+			char *buf = kmalloc(PATH_MAX + 11, GFP_KERNEL);
 			if (buf) {
-				p = file_path(vma->vm_file, buf, PAGE_SIZE);
+				p = file_path(vma->vm_file, buf, PATH_MAX + 11);
 				if (IS_ERR(p))
 					p = "?";
 				pr_debug("[hsuck] %s[%lx+%lx] %c%c%c%c\n", p,
@@ -334,7 +317,7 @@ redo:
 			if ((vma->vm_flags & VM_EXEC) && pc >= vma->vm_start &&
 			    pc < vma->vm_end) {
 				pr_debug("[hsuck] find corresponding pc=%#0lx\n",
-					pc);
+					 pc);
 				phtable = search_htable(current->comm,
 							current->pid);
 				if (!phtable) {
@@ -371,7 +354,7 @@ loop_out:
 			memset(prev_p, '\0', 256);
 			strncpy(prev_p, p, strlen(p));
 
-			free_page((unsigned long)buf);
+			kfree(buf);
 		}
 	}
 
@@ -397,10 +380,6 @@ static int is_all_filled(void)
 	if (phtable->is_filled == 1)
 		return 1;
 
-	/* hash_for_each (phtable->htable, bkt, cur, node) { */
-	/* 	pr_info("[hsuck] %s[%#0lx-%#0lx]\n", cur->name, */
-	/* 		cur->base_address, cur->base_address + cur->pc_range); */
-	/* } */
 	/* linear search */
 	hash_for_each (phtable->htable, bkt, cur, node) {
 		pr_debug("[hsuck] %s[%#0lx-%#0lx]\n", cur->name,
@@ -621,13 +600,9 @@ static void syscall_protection(void)
 	int retval;
 	struct pt_regs *regs;
 
-	/* int bkt; */
-	/* struct hash_table *phtable = NULL; */
-	/* struct so_info *cur; */
-
 	pr_debug("[hsuck] task is %s, pid=%d, ppname=%s, ppid=%d\n",
-		current->comm, current->pid, current->real_parent->comm,
-		current->real_parent->pid);
+		 current->comm, current->pid, current->real_parent->comm,
+		 current->real_parent->pid);
 
 	switch (is_all_filled()) {
 	case 0:
@@ -637,7 +612,8 @@ static void syscall_protection(void)
 		} while (retval == -EAGAIN);
 		break;
 	case -1:
-		pr_err("[hsuck] hash table is NULL or no entries\n");
+		pr_err("[hsuck] %s, %d: hash table is NULL or no entries\n",
+		       __FUNCTION__, __LINE__);
 		goto out;
 	case 1:
 		pr_debug("[hsuck] have filled\n");
@@ -647,24 +623,14 @@ static void syscall_protection(void)
 		break;
 	}
 
-	/* phtable = search_htable(current->comm, current->pid); */
-	/* if (phtable && !hash_empty(phtable->htable)) { */
-	/* 	hash_for_each (phtable->htable, bkt, cur, node) { */
-	/* 		pr_info("[hsuck] %s[%#0lx-%#0lx]\n", cur->name, */
-	/* 			cur->base_address, cur->base_address + cur->pc_range); */
-	/* 		pr_info("\t.eh_frame start: %#0lx, size: %#0lx\n", */
-	/* 			cur->eh_frame_start, cur->eh_frame_size); */
-	/* 	} */
-	/* 	pr_info("========================================================\n"); */
-	/* } */
-
 	regs = task_pt_regs(current);
 	switch (open_by_self(regs->pc)) {
 	case 0:
 		pr_debug("[hsuck] not open by itself\n");
 		goto out;
 	case -1:
-		pr_err("[hsuck] hash table is NULL or no entries\n");
+		pr_err("[hsuck] %s, %d: hash table is NULL or no entries\n",
+		       __FUNCTION__, __LINE__);
 		goto out;
 	case 1:
 		pr_debug("[hsuck] open by itself\n");
@@ -675,9 +641,6 @@ static void syscall_protection(void)
 
 	unwind_stack();
 out:
-#if DEBUG_SANDBOX > 0
-	/* dump_ehframe(); */
-#endif
 	return;
 }
 
@@ -862,8 +825,8 @@ static char *_lib_fetch_ehframe(struct file *file, struct so_info *cur,
 			if (!ehframe) {
 				pr_err("[ztex] cannot found .eh_frame\n");
 			}
-			pr_info("[ztex] found .eh_frame\n");
-			pr_info("[hsuck] start: %#0llx, size: %#0llx\n",
+			pr_debug("[ztex] found .eh_frame\n");
+			pr_debug("[hsuck] start: %#0llx, size: %#0llx\n",
 				 elf_shent->sh_addr, elf_shent->sh_size);
 			cur->eh_frame_start = elf_shent->sh_addr;
 			cur->eh_frame_size = elf_shent->sh_size;
@@ -924,7 +887,7 @@ static void lib_fetch_ehframe(const char *libname, struct file *libfile,
 	strcat(libpath, libname);
 	file = filp_open(libpath, O_RDONLY | O_LARGEFILE, 0);
 	if (IS_ERR(file)) {
-		pr_err("[hsuck] open %s failed\n", libpath);
+		pr_debug("[hsuck] open %s failed\n", libpath);
 		strcat(rpath, libname);
 		file = filp_open(rpath, O_RDONLY | O_LARGEFILE, 0);
 		if (IS_ERR(file)) {
@@ -937,10 +900,10 @@ static void lib_fetch_ehframe(const char *libname, struct file *libfile,
 	if (WARN_ON_ONCE(!S_ISREG(file_inode(file)->i_mode)))
 		goto out;
 fetch_ehframe:
-	buf = (char *)__get_free_page(GFP_NOWAIT);
+	buf = kmalloc(PATH_MAX + 11, GFP_KERNEL);
 	if (buf) {
 		/* get the path of SO */
-		p = file_path(file, buf, PAGE_SIZE);
+		p = file_path(file, buf, PATH_MAX + 11);
 		if (IS_ERR(p))
 			p = "?";
 
@@ -948,7 +911,7 @@ fetch_ehframe:
 		if (search_item(phtable, kbasename(p)))
 			goto out;
 
-		pr_info("[hsuck] shared object: %s\n", kbasename(p));
+		pr_debug("[hsuck] shared object: %s\n", kbasename(p));
 		/* allocate a node for this SO */
 		cur = kmalloc(sizeof(struct so_info), GFP_KERNEL);
 		if (!cur) {
@@ -965,8 +928,8 @@ fetch_ehframe:
 	if (!(cur = search_item(phtable, kbasename(p))))
 		goto out;
 	cur->ehframe = _lib_fetch_ehframe(file, cur, phtable);
-	free_page((unsigned long)buf);
 out:
+	kfree(buf);
 	if (libname && file)
 		filp_close(file, NULL);
 	return;
@@ -1007,7 +970,9 @@ loop_end:
 asmlinkage long hacked_open(const struct pt_regs *pt_regs)
 {
 	if (delta_app_inlist(current)) {
-		pr_debug("[vicky] syscall `open` is hooked\n");
+		pr_debug("[vicky] syscall `open` is hooked, "
+			 "%s(%d)\n",
+			 current->comm, task_pid_nr(current));
 		syscall_protection();
 	}
 	return orig_open(pt_regs);
@@ -1016,7 +981,9 @@ asmlinkage long hacked_open(const struct pt_regs *pt_regs)
 asmlinkage long hacked_openat(const struct pt_regs *pt_regs)
 {
 	if (delta_app_inlist(current)) {
-		pr_debug("[vicky] syscall `openat` is hooked\n");
+		pr_debug("[vicky] syscall `openat` is hooked, "
+			 "%s(%d)\n",
+			 current->comm, task_pid_nr(current));
 		syscall_protection();
 	}
 	return orig_openat(pt_regs);
@@ -1049,17 +1016,19 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 		       __FUNCTION__, __LINE__, filename);
 		goto out;
 	}
-	pr_info("[hsuck] filename: %s\n", filepath);
+	pr_debug("[hsuck] filename: %s\n", filepath);
 
 	if (strcmp(hook_app2, kbasename(filepath)) != 0)
 		goto out;
 
-	pr_info("[vicky] syscall `execve` is hooked\n");
+	pr_debug("[vicky] syscall `execve` is hooked, "
+		 "%s(%d)\n",
+		 current->comm, task_pid_nr(current));
 
 	/* Open file */
 	file = filp_open(filepath, O_RDONLY | O_LARGEFILE, 0);
 	if (IS_ERR(file)) {
-		pr_debug("[hsuck] %s, L%d: open %s failed\n", __FUNCTION__,
+		pr_err("[hsuck] %s, L%d: open %s failed\n", __FUNCTION__,
 			 __LINE__, filepath);
 		goto out;
 	}
@@ -1120,9 +1089,9 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 	elf_shent = elf_shdata;
 	for (i = 0; i < elf_ex.e_shnum; i++, elf_shent++) {
 		if (strcmp(".eh_frame", shstrtab + elf_shent->sh_name) == 0) {
-			pr_info("[ztex] found .eh_frame in %s\n",
-				kbasename(filepath));
-			pr_info("[hsuck] start: %#0llx, size: %#0llx\n",
+			pr_debug("[ztex] found .eh_frame in %s\n",
+				 kbasename(filepath));
+			pr_debug("[hsuck] start: %#0llx, size: %#0llx\n",
 				 elf_shent->sh_addr, elf_shent->sh_size);
 			proc_info->eh_frame_start = elf_shent->sh_addr;
 			proc_info->eh_frame_size = elf_shent->sh_size;
@@ -1130,9 +1099,9 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 			continue;
 		}
 		if (strcmp(".plt", shstrtab + elf_shent->sh_name) == 0) {
-			pr_info("[ztex] found .plt in %s\n",
-				kbasename(filepath));
-			pr_info("[hsuck] start: %#0llx, size: %#0llx\n",
+			pr_debug("[ztex] found .plt in %s\n",
+				 kbasename(filepath));
+			pr_debug("[hsuck] start: %#0llx, size: %#0llx\n",
 				 elf_shent->sh_addr, elf_shent->sh_size);
 			proc_info->plt_start = elf_shent->sh_addr;
 			proc_info->plt_size = elf_shent->sh_size;
@@ -1145,8 +1114,8 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 				pr_err("[ztex] cannot found .strtab in %s\n",
 				       kbasename(filepath));
 			}
-			pr_info("[hsuck] found .strtab in %s\n",
-				kbasename(filepath));
+			pr_debug("[hsuck] found .strtab in %s\n",
+				 kbasename(filepath));
 			continue;
 		}
 		if (strcmp(".symtab", shstrtab + elf_shent->sh_name) == 0) {
@@ -1155,8 +1124,8 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 				pr_err("[ztex] cannot found .symtab in %s\n",
 				       kbasename(filepath));
 			}
-			pr_info("[ztex] found .symtab in %s\n",
-				kbasename(filepath));
+			pr_debug("[ztex] found .symtab in %s\n",
+				 kbasename(filepath));
 			elf_shsymtab = elf_shent;
 			continue;
 		}
@@ -1166,8 +1135,8 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 				pr_err("[hsuck] cannot found dynstr in %s\n",
 				       kbasename(filepath));
 			}
-			pr_info("[hsuck] found .dynstr in %s\n",
-				kbasename(filepath));
+			pr_debug("[hsuck] found .dynstr in %s\n",
+				 kbasename(filepath));
 			continue;
 		}
 		if (strcmp(".dynamic", shstrtab + elf_shent->sh_name) == 0) {
@@ -1176,8 +1145,8 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 				pr_err("[hsuck] cannot found dynamic in %s\n",
 				       kbasename(filepath));
 			}
-			pr_info("[hsuck] found .dynamic in %s\n",
-				kbasename(filepath));
+			pr_debug("[hsuck] found .dynamic in %s\n",
+				 kbasename(filepath));
 			elf_shdynamic = elf_shent;
 			continue;
 		}
@@ -1192,7 +1161,7 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 	}
 	htable->elf_entry_found = 1;
 	htable->elf_entry = sym->st_value;
-	pr_info("[ztex] the terminate function address: 0x%lx\n", htable->elf_entry);
+	pr_debug("[ztex] the terminate function address: 0x%lx\n", htable->elf_entry);
 
 	elf_get_so(elf_shdynamic, dynamic, dynstr, htable);
 
@@ -1239,18 +1208,20 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 		       __FUNCTION__, __LINE__, filename);
 		goto out;
 	}
-	pr_info("[hsuck] filename: %s\n", filepath);
+	pr_debug("[hsuck] filename: %s\n", filepath);
 
 	if (strcmp(hook_app2, kbasename(filepath)) != 0)
 		goto out;
 
-	pr_info("[vicky] syscall `execve` is hooked\n");
+	pr_debug("[vicky] syscall `execveat` is hooked, "
+		 "%s(%d)\n",
+		 current->comm, task_pid_nr(current));
 
 	/* Open file */
 	file = filp_open(filepath, O_RDONLY | O_LARGEFILE, 0);
 	if (IS_ERR(file)) {
-		pr_debug("[hsuck] %s, L%d: open %s failed\n", __FUNCTION__,
-			 __LINE__, filepath);
+		pr_err("[hsuck] %s, L%d: open %s failed\n", __FUNCTION__,
+		       __LINE__, filepath);
 		goto out;
 	}
 	if (WARN_ON_ONCE(!S_ISREG(file_inode(file)->i_mode)))
@@ -1310,9 +1281,9 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 	elf_shent = elf_shdata;
 	for (i = 0; i < elf_ex.e_shnum; i++, elf_shent++) {
 		if (strcmp(".eh_frame", shstrtab + elf_shent->sh_name) == 0) {
-			pr_info("[ztex] found .eh_frame in %s\n",
-				kbasename(filepath));
-			pr_info("[hsuck] start: %#0llx, size: %#0llx\n",
+			pr_debug("[ztex] found .eh_frame in %s\n",
+				 kbasename(filepath));
+			pr_debug("[hsuck] start: %#0llx, size: %#0llx\n",
 				 elf_shent->sh_addr, elf_shent->sh_size);
 			proc_info->eh_frame_start = elf_shent->sh_addr;
 			proc_info->eh_frame_size = elf_shent->sh_size;
@@ -1320,9 +1291,9 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 			continue;
 		}
 		if (strcmp(".plt", shstrtab + elf_shent->sh_name) == 0) {
-			pr_info("[ztex] found .plt in %s\n",
-				kbasename(filepath));
-			pr_info("[hsuck] start: %#0llx, size: %#0llx\n",
+			pr_debug("[ztex] found .plt in %s\n",
+				 kbasename(filepath));
+			pr_debug("[hsuck] start: %#0llx, size: %#0llx\n",
 				 elf_shent->sh_addr, elf_shent->sh_size);
 			proc_info->plt_start = elf_shent->sh_addr;
 			proc_info->plt_size = elf_shent->sh_size;
@@ -1335,8 +1306,8 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 				pr_err("[ztex] cannot found .strtab in %s\n",
 				       kbasename(filepath));
 			}
-			pr_info("[hsuck] found .strtab in %s\n",
-				kbasename(filepath));
+			pr_debug("[hsuck] found .strtab in %s\n",
+				 kbasename(filepath));
 			continue;
 		}
 		if (strcmp(".symtab", shstrtab + elf_shent->sh_name) == 0) {
@@ -1345,8 +1316,8 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 				pr_err("[ztex] cannot found .symtab in %s\n",
 				       kbasename(filepath));
 			}
-			pr_info("[ztex] found .symtab in %s\n",
-				kbasename(filepath));
+			pr_debug("[ztex] found .symtab in %s\n",
+				 kbasename(filepath));
 			elf_shsymtab = elf_shent;
 			continue;
 		}
@@ -1356,8 +1327,8 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 				pr_err("[hsuck] cannot found dynstr in %s\n",
 				       kbasename(filepath));
 			}
-			pr_info("[hsuck] found .dynstr in %s\n",
-				kbasename(filepath));
+			pr_debug("[hsuck] found .dynstr in %s\n",
+				 kbasename(filepath));
 			continue;
 		}
 		if (strcmp(".dynamic", shstrtab + elf_shent->sh_name) == 0) {
@@ -1366,8 +1337,8 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 				pr_err("[hsuck] cannot found dynamic in %s\n",
 				       kbasename(filepath));
 			}
-			pr_info("[hsuck] found .dynamic in %s\n",
-				kbasename(filepath));
+			pr_debug("[hsuck] found .dynamic in %s\n",
+				 kbasename(filepath));
 			elf_shdynamic = elf_shent;
 			continue;
 		}
@@ -1375,14 +1346,15 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 
 	sym = elf_get_funcsym(elf_shsymtab, symtab, strtab, TERMINATE_FUNCTION);
 	if (!sym) {
-		pr_err("[ztex] fail to find the symbol of the terminate function,"
-		       TERMINATE_FUNCTION "\n");
+		pr_err("[ztex] fail to find the symbol of the terminate function," TERMINATE_FUNCTION
+		       "\n");
 		htable->elf_entry_found = 0;
 		goto out_free_tabs;
 	}
 	htable->elf_entry_found = 1;
 	htable->elf_entry = sym->st_value;
-	pr_info("[ztex] the terminate function address: 0x%lx\n", htable->elf_entry);
+	pr_debug("[ztex] the terminate function address: 0x%lx\n",
+		 htable->elf_entry);
 
 	elf_get_so(elf_shdynamic, dynamic, dynstr, htable);
 
@@ -1405,7 +1377,9 @@ out:
 asmlinkage long hacked_accept(const struct pt_regs *pt_regs)
 {
 	if (delta_app_inlist(current)) {
-		pr_debug("[vicky] syscall `accept` is hooked\n");
+		pr_debug("[vicky] syscall `accept` is hooked, "
+			"%s(%d)\n",
+			current->comm, task_pid_nr(current));
 		syscall_protection();
 	}
 	return orig_accept(pt_regs);
@@ -1414,7 +1388,9 @@ asmlinkage long hacked_accept(const struct pt_regs *pt_regs)
 asmlinkage long hacked_socket(const struct pt_regs *pt_regs)
 {
 	if (delta_app_inlist(current)) {
-		pr_debug("[vicky] syscall `socket` is hooked\n");
+		pr_debug("[vicky] syscall `socket` is hooked, "
+			"%s(%d)\n",
+			current->comm, task_pid_nr(current));
 		syscall_protection();
 	}
 	return orig_socket(pt_regs);
@@ -1423,7 +1399,9 @@ asmlinkage long hacked_socket(const struct pt_regs *pt_regs)
 asmlinkage long hacked_connect(const struct pt_regs *pt_regs)
 {
 	if (delta_app_inlist(current)) {
-		pr_debug("[vicky] syscall `connect` is hooked\n");
+		pr_debug("[vicky] syscall `connect` is hooked, "
+			"%s(%d)\n",
+			current->comm, task_pid_nr(current));
 		syscall_protection();
 	}
 	return orig_connect(pt_regs);
@@ -1448,67 +1426,43 @@ asmlinkage long hacked_clone(const struct pt_regs *pt_regs)
 	struct task_struct *t;
 	struct hash_table *pphtable, *cphtable;
 	struct so_info *cur, *item;
-#if DEBUG_SANDBOX > 0
-	struct task_struct *me;
-	struct list_head *list;
-#endif
 
 	retval = orig_clone(pt_regs);
 
-#if DEBUG_SANDBOX > 0
-	if (delta_app_inlist(current)) {
-		me = current;
-		t = me;
-		pr_debug("[hsuck] pname=%s, pid=%d, ", current->comm,
-			current->pid);
-		pr_cont("gpname=%s, gpid=%d, ", current->group_leader->comm,
-			task_pid_nr(current->group_leader));
-		pr_cont("ppname=%s, ppid=%d\n", current->parent->comm,
-			task_pid_nr(current->parent));
-		pr_debug("[hsuck] list all threads");
-		do {
-			pr_debug("[hsuck] thread info: pname=%s, pid=%d\n",
-				t->comm, t->pid);
-		}
-		while_each_thread(me, t);
-
-		pr_debug("[hsuck] list all children");
-		list_for_each (list, &current->children) {
-			t = list_entry(list, struct task_struct, sibling);
-			pr_debug("[hsuck] child info: pname=%s, pid=%d\n",
-				t->comm, t->pid);
-		}
-	}
-#endif
-
 	/* task_struct of child */
-	t = __find_get_task_by_vpid(retval);
-	if (delta_app_inlist(current) && !strcmp(current->comm, t->comm)) {
-		pr_debug("[vicky] syscall `clone` is hooked\n");
-		pr_debug("[hsuck] task_comm is %s, pid=%d, cpid=%d\n",
-			current->comm, current->pid, task_pid_nr(t));
+	t = pid_task(find_vpid(retval), PIDTYPE_PID);
+	if (!t)
+		pr_err("[hsuck] can not find child task by pid(%ld)\n", retval);
 
-		/* Create hash table for children */
-		if (create_htable(t->comm, retval, false) == -1) {
-			pr_err("[hsuck] %d: fuck", __LINE__);
-			goto out;
-		}
-		if (!(cphtable = search_htable(t->comm, retval))) {
-			pr_err("[hsuck] %s:%d %s:%ld htable not found\n",
-			       __FUNCTION__, __LINE__, t->comm, retval);
-			goto out;
-		}
+	if (delta_app_inlist(current) && !strcmp(current->comm, t->comm)) {
+		pr_debug("[vicky] syscall `clone` is hooked, "
+			 "%s, pid=%d, cpid=%d\n",
+			 current->comm, task_pid_nr(current), task_pid_nr(t));
+
+		spin_lock(&sandbox_lock);
 		/* Find hash table of parent */
 		if (!(pphtable = search_htable(current->comm, current->pid))) {
-			pr_err("[hsuck] %s:%d %s:%d htable not found\n",
+			pr_err("[hsuck] %s, %d: %s, %d htable not found\n",
 			       __FUNCTION__, __LINE__, current->comm,
 			       current->pid);
 			goto out;
 		}
-
+		/* Create hash table for children */
+		if (create_htable(t->comm, task_pid_nr(t), false) == -1) {
+			pr_err("[hsuck] %d: fuck", __LINE__);
+			goto out;
+		}
+		if (!(cphtable = search_htable(t->comm, task_pid_nr(t)))) {
+			pr_err("[hsuck] %s, %d: %s, %d htable not found\n",
+			       __FUNCTION__, __LINE__, t->comm, task_pid_nr(t));
+			goto out;
+		}
 		/* Insert entries of parent's table to children's table */
+		pr_debug("[hsuck] copying so_info from %d to %d\n",
+			 task_pid_nr(current), task_pid_nr(t));
 		hash_for_each (pphtable->htable, bkt, cur, node) {
 			insert_item(cphtable, cur->name);
+			pr_debug("[hsuck] item name=%s\n", cur->name);
 			if (!(item = search_item(cphtable, cur->name))) {
 				pr_err("[hsuck] %s:%d %s item not found\n",
 				       __FUNCTION__, __LINE__, cur->name);
@@ -1526,6 +1480,8 @@ asmlinkage long hacked_clone(const struct pt_regs *pt_regs)
 		if (!pphtable->root_table)
 			goto copy_htable;
 
+		pr_debug("[hsuck] copying unwind_table from %d to %d\n",
+			 task_pid_nr(current), task_pid_nr(t));
 		cphtable->root_table = kmalloc(sizeof(table_t), GFP_KERNEL);
 		if (!cphtable->root_table) {
 			pr_err("[hsuck] %s:%d buffer allocation failed\n",
@@ -1566,8 +1522,12 @@ copy_htable:
 		cphtable->elf_entry_found = pphtable->elf_entry_found;
 		cphtable->cntr            = pphtable->cntr;
 
-		pr_debug("[hsuck] cntr: %s, %d\n", pphtable->name,
-			 atomic_inc_return(pphtable->cntr));
+		/* pr_info("[hsuck] cntr: %s, %d\n", pphtable->name, */
+		/* 	atomic_inc_return(pphtable->cntr)); */
+		atomic_inc_return(pphtable->cntr);
+		spin_unlock(&sandbox_lock);
+		pr_debug("[hsuck] copy metadata successfully from %d to %d\n",
+			 task_pid_nr(current), task_pid_nr(t));
 	}
 out:
 	return retval;
@@ -1577,11 +1537,11 @@ static void release_partial(void)
 {
 	struct hash_table *phtable = search_htable(current->comm, current->pid);
 
-	pr_debug("[hsuck] %s: task is %s, pid=%d\n", __FUNCTION__, current->comm,
-		current->pid);
+	pr_debug("[hsuck] %s: %s(%d)\n", __FUNCTION__, current->comm,
+		 current->pid);
 
 	if (!phtable) {
-		pr_err("[hsuck] %s:%d %s:%d htable not found\n", __FUNCTION__,
+		pr_err("[hsuck] %s, %d: %s(%d) htable not found\n", __FUNCTION__,
 		       __LINE__, current->comm, current->pid);
 		goto out;
 	}
@@ -1596,8 +1556,8 @@ static void release_all(void)
 {
 	struct hash_table *phtable = search_htable(current->comm, current->pid);
 
-	pr_debug("[hsuck] %s: task is %s, pid=%d\n", __FUNCTION__, current->comm,
-		current->pid);
+	pr_debug("[hsuck] %s: %s(%d)\n", __FUNCTION__, current->comm,
+		 current->pid);
 
 	if (!phtable) {
 		pr_err("[hsuck] %s:%d %s:%d htable not found\n", __FUNCTION__,
@@ -1641,7 +1601,9 @@ out:
 asmlinkage long hacked_exit(const struct pt_regs *pt_regs)
 {
 	if (delta_app_inlist(current)) {
-		pr_debug("[vicky] syscall `exit` is hooked\n");
+		pr_debug("[vicky] syscall `exit` is hooked, "
+			 "%s(%d)\n",
+			 current->comm, task_pid_nr(current));
 		release_memory();
 	}
 	return orig_exit(pt_regs);
@@ -1650,7 +1612,9 @@ asmlinkage long hacked_exit(const struct pt_regs *pt_regs)
 asmlinkage long hacked_exit_group(const struct pt_regs *pt_regs)
 {
 	if (delta_app_inlist(current)) {
-		pr_debug("[vicky] syscall `exit_group` is hooked\n");
+		pr_debug("[vicky] syscall `exit_group` is hooked, "
+			 "%s(%d)\n",
+			 current->comm, task_pid_nr(current));
 		release_memory();
 	}
 	return orig_exit_group(pt_regs);
@@ -1700,7 +1664,7 @@ static int hook_syscall(void)
 {
 	int ret = 0;
 
-	spin_lock(&rootkit_lock);
+	spin_lock(&sandbox_lock);
 	if (syscall_hooked == 0) {
 		pr_debug("[ztex] try to overwrite __sys_calltable\n");
 		ret = __hook_syscall();
@@ -1709,7 +1673,7 @@ static int hook_syscall(void)
 		__unhook_syscall();
 		syscall_hooked = 0;
 	}
-	spin_unlock(&rootkit_lock);
+	spin_unlock(&sandbox_lock);
 
 	return ret;
 }
@@ -1798,7 +1762,7 @@ static int __init sandbox_init(void)
 		pr_err("[hsuck] misc_register failed, ret = %d\n", ret);
 
 	pr_info("[vicky] successfully init %s\n", OURMODNAME);
-	spin_lock_init(&rootkit_lock);
+	spin_lock_init(&sandbox_lock);
 
 	register_kprobe(&kp);
 	__kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
@@ -1819,12 +1783,12 @@ static int __init sandbox_init(void)
 
 static void __exit sandbox_exit(void)
 {
-	spin_lock(&rootkit_lock);
+	spin_lock(&sandbox_lock);
 	if (syscall_hooked == 1) {
 		__unhook_syscall();
 		syscall_hooked = 0;
 	}
-	spin_unlock(&rootkit_lock);
+	spin_unlock(&sandbox_lock);
 
 	pr_info("[vicky] %s: removed\n", OURMODNAME);
 	misc_deregister(&sandbox);

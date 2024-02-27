@@ -1,7 +1,7 @@
 obj-m += sandbox-unwind.o
 obj-m += sandbox.o
 PWD = $(shell pwd)
-KDIR = /lib/modules/6.3.0-asahi-13-1-edge-ARCH/build/edge/
+KDIR = /lib/modules/6.3.0-asahi-11-1-ARCH/build/base
 EXTRA_CFLAGS = -Wall -g
 
 all:
@@ -13,7 +13,9 @@ ins:
 	dmesg
 
 rm:
+	sudo dmesg -C
 	sudo rmmod sandbox sandbox-unwind
+	dmesg
 	sudo dmesg -C
 
 clean:

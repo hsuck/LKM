@@ -144,7 +144,7 @@ struct hash_table {
 	atomic_t *cntr;
 	table_t *root_table;
 	struct hlist_node node;
-	DECLARE_HASHTABLE(htable, 8);
+	DECLARE_HASHTABLE(htable, 16);
 };
 
 /**
@@ -161,7 +161,8 @@ struct hash_table {
  * @name          : the filename
 */
 struct so_info {
-	char *ehframe, *name;
+	const char *ehframe;
+	char *name;
 	unsigned long base_address, eh_frame_size, eh_frame_start, plt_size,
 		plt_start, pc_range;
 	short eh_frame_found, plt_found;
