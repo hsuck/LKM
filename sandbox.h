@@ -13,7 +13,7 @@
 		} while (0);                \
 	}
 
-int delta_app_inlist(struct task_struct *);
+int delta_app_inlist(const char *);
 
 static int is_all_filled(void);
 

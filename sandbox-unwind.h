@@ -132,6 +132,7 @@ typedef struct unwind_table {
 	unsigned long hdrsz;
 	char name[TASK_COMM_LEN];
 	const struct so_info *info;
+	const void **state_cache; 
 
 	struct unwind_table *next, *prev;
 } table_t;
@@ -140,7 +141,7 @@ struct hash_table {
 	pid_t pid;
 	char *name;
 	short is_filled, is_inited, elf_entry_found;
-	unsigned long elf_entry, clone_entry;
+	unsigned long elf_entry, clone_entry, child_main;
 	atomic_t *cntr;
 	table_t *root_table;
 	struct hlist_node node;

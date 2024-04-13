@@ -157,7 +157,7 @@ typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 kallsyms_lookup_name_t __kallsyms_lookup_name;
 
 int (*traverse_vma)(unsigned long);
-int (*delta_app_inlist)(struct task_struct *);
+int (*delta_app_inlist)(const char *);
 
 /** TODO: ztex
  * unwind_add_table() - Add the new unwind table to this list
@@ -212,7 +212,7 @@ static const table_t *_find_table(const struct hash_table *phtable,
 		start = ptable->info->base_address;
 		end = start + ptable->info->pc_range;
 		pr_debug("[hsuck] pc range[%#0lx-%#0lx]\n", start, end);
-		if (pc >= start && pc < end) {
+		if (pc >= start && pc <= end) {
 			found = 1;
 			break;
 		}
@@ -596,8 +596,9 @@ void deinit_unwind_table(struct hash_table *phtable, int mode)
 	do {
 		tmp = cur;
 		cur = cur->next;
-		if (mode == 1)
+		if (mode == 1) {
 			RELEASE_MEMORY(tmp->header);
+		}
 		RELEASE_MEMORY(tmp);
 	} while (cur && cur != phtable->root_table);
 
@@ -615,6 +616,7 @@ static void _init_unwind_table(struct hash_table *phtable, struct so_info *cur,
 	unsigned long table_start = (unsigned long)cur->ehframe;
 	unsigned long tableSize = cur->eh_frame_size;
 	unsigned long user_base = cur->base_address + cur->eh_frame_start;
+	struct unwind_state *state_cache;
 	struct {
 		u8 version;
 		u8 eh_frame_ptr_enc;
@@ -686,9 +688,15 @@ first:
 	// FIXME ztex: this size is related to the size of `header` and the size of `struct eh_frame_hdr_table_entry`
 	hdrSize = 4 + sizeof(unsigned long) + sizeof(unsigned int)
 		+ n * sizeof(struct eh_frame_hdr_table_entry);
-	header = kmalloc(hdrSize, GFP_KERNEL);
+	header = kzalloc(hdrSize, GFP_KERNEL);
 	if (!header) {
 		pr_err("[ztex] fail to allocate header for size: %u\n", hdrSize);
+		goto ret_err;
+	}
+	state_cache = kzalloc(n * sizeof(struct unwind_state *), GFP_KERNEL);
+	if (!state_cache) {
+		pr_err("[hsuck] %s, L%d: fail to allocate buffer for cache\n",
+		       __FUNCTION__, __LINE__);
 		goto ret_err;
 	}
 	// reference: https://refspecs.linuxfoundation.org/LSB_1.3.0/gLSB/gLSB/ehframehdr.html
@@ -739,6 +747,7 @@ first:
 	table->hdrsz = hdrSize;
 	smp_wmb();
 	table->header = (const void *)header;
+	table->state_cache = (const void **)state_cache;
 	get_task_comm(table->name, frame->task);
 	pr_debug("[ztex] parsing .eh_frame sucessful\n");
 inited:
@@ -1030,18 +1039,20 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 	signed ptrType = -1;
 	uleb128_t retAddrReg = 0;
 	const table_t  *table;
-	struct unwind_state state;
+	struct unwind_state *state;
 	unsigned long *fptr;
 	unsigned long temp = 0;
 	struct eh_frame_hdr_table_entry *temp_ptr;
 	unsigned long bs_mid, bs_l, bs_r;
 	unsigned long kern_base, user_base, addr;
+	bool cached = false;
 
 	pr_debug("[hsuck] %s, pc: %lx, sp: %lx\n", __FUNCTION__, UNW_PC(frame),
 		 UNW_SP(frame));
 
 	if (UNW_PC(frame) == 0) {
-		pr_err("[vicky] failed at [%s]: %d\n", __FUNCTION__, __LINE__);
+		pr_err("[hsuck] %s, pc: %lx, sp: %lx\n", __FUNCTION__,
+			UNW_PC(frame), UNW_SP(frame));
 		return -EINVAL;
 	}
 
@@ -1138,7 +1149,6 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 		 translate_kern_to_user(kern_base, user_base, startLoc),
 		 translate_kern_to_user(kern_base, user_base,
 					(const unsigned long)fde));
-
 	//startLoc = FDE pc begin
 	//fde = fde addr
 	if (fde != NULL) {
@@ -1164,7 +1174,7 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 				 read_pointer(&ptr,
 					      (const u8 *)(fde + 1) + *fde,
 					      ptrType, kern_base, user_base);
-			if (pc_kern >= endLoc || pc_kern < startLoc) {
+			if (pc_kern > endLoc || pc_kern < startLoc) {
 				pr_err("[vicky] failed at [%s]: %d, "
 				       "startLoc = %lx, pc_kern = %lx, endLoc = %lx, "
 				       "base = %lx, main() = %lx\n",
@@ -1179,7 +1189,6 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 
 	frame->entry_point =
 		translate_kern_to_user(kern_base, user_base, startLoc);
-	/* frame->entry_end = translate_kern_to_user(kern_base, user_base, endLoc); */
 	/* We have reached main or clone */
 	if (startLoc ==
 	    translate_user_to_kern(kern_base, user_base, phtable->elf_entry))
@@ -1187,10 +1196,24 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 	else if (startLoc == translate_user_to_kern(kern_base, user_base,
 						    phtable->clone_entry))
 		return 2;
+	else if (startLoc == translate_user_to_kern(kern_base, user_base,
+						    phtable->child_main))
+		return 3;
 
 	if (cie != NULL) {
-		memset(&state, 0, sizeof(state));
-		state.cieEnd = ptr;	/* keep here temporarily */
+		/* memset(&state, 0, sizeof(state)); */
+		if (table->state_cache == NULL)
+			pr_err("[hsuck] fuck\n");
+		if (!(const struct unwind_state *)table->state_cache[bs_r]) {
+			state = kzalloc(sizeof(struct unwind_state),
+					GFP_KERNEL);
+			table->state_cache[bs_r] = (const void *)state;
+			state->cieEnd = ptr; /* keep here temporarily */
+
+		} else {
+			state = (struct unwind_state *)table->state_cache[bs_r];
+			cached = true;
+		}
 		ptr = (const u8 *)(cie + 2);
 		end = (const u8 *)(cie + 1) + *cie;
 		frame->call_frame = 1;
@@ -1225,24 +1248,32 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 		       __FUNCTION__, __LINE__);
 	}
 
+	if (cached) {
+		get_uleb128(&ptr, end);
+		get_sleb128(&ptr, end);
+		retAddrReg = state->version <= 1 ? *ptr++ :
+						   get_uleb128(&ptr, end);
+		goto unwind;
+	}
+
 	if (cie != NULL) {
 		/* get code alignment factor */
-		state.codeAlign = get_uleb128(&ptr, end);
+		state->codeAlign = get_uleb128(&ptr, end);
 		/* get data alignment factor */
-		state.dataAlign = get_sleb128(&ptr, end);
-		if (state.codeAlign == 0 || state.dataAlign == 0 || ptr >= end){
+		state->dataAlign = get_sleb128(&ptr, end);
+		if (state->codeAlign == 0 || state->dataAlign == 0 || ptr >= end){
 			pr_err("[vicky] failed at [%s]: %d, cie is NULL\n",
 			       __FUNCTION__, __LINE__);
 			cie = NULL;
 		}
 		else {
-			retAddrReg = state.version <= 1 ?
+			retAddrReg = state->version <= 1 ?
 					     *ptr++ :
 					     get_uleb128(&ptr, end);
 			pr_debug("[hsuck] CIE Frame Info:\n");
 			pr_debug("[hsuck] return Address register 0x%lx\n", retAddrReg);
-			pr_debug("[hsuck] data Align: %ld\n", state.dataAlign);
-			pr_debug("[hsuck] code Align: %lu\n", state.codeAlign);
+			pr_debug("[hsuck] data Align: %ld\n", state->dataAlign);
+			pr_debug("[hsuck] code Align: %lu\n", state->codeAlign);
 			/* skip augmentation */
 			if (((const char *)(cie + 2))[1] == 'z') {
 				uleb128_t augSize = get_uleb128(&ptr, end);
@@ -1263,9 +1294,9 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 	}
 
 	if (cie != NULL) {
-		state.cieStart = ptr;
-		ptr = state.cieEnd;
-		state.cieEnd = end;
+		state->cieStart = ptr;
+		ptr = state->cieEnd;
+		state->cieEnd = end;
 		end = (const u8 *)(fde + 1) + *fde;
 		/* skip augmentation */
 		if (((const char *)(cie + 2))[1] == 'z') {
@@ -1278,16 +1309,18 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 	if (cie == NULL) {
 		pr_err("[vicky] failed at [%s]: %d, cie is NULL\n",
 		       __FUNCTION__, __LINE__);
+		/* RELEASE_MEMORY(state); */
 		return -EINVAL;
 	}
 
 	if (fde == NULL) {
 		pr_err("[vicky] failed at [%s]: %d, fde is NULL\n",
 		       __FUNCTION__, __LINE__);
+		/* RELEASE_MEMORY(state); */
 		return -EINVAL;
 	}
-	state.org = startLoc;
-	memcpy(&state.cfa, &badCFA, sizeof(state.cfa));
+	state->org = startLoc;
+	memcpy(&state->cfa, &badCFA, sizeof(state->cfa));
 
 	/* process instructions
 	 * For ARC, we optimize by having blink(retAddrReg) with
@@ -1295,45 +1328,47 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 	 * state.regs[retAddrReg].where == Nowhere
 	 */
 	pr_debug("[hsuck] Processing CFI\n");
-	if (!processCFI(ptr, end, pc_kern, ptrType, &state, kern_base,
+	if (!processCFI(ptr, end, pc_kern, ptrType, state, kern_base,
 			user_base) ||
-	    state.loc > endLoc ||
+	    state->loc > endLoc ||
 	    /* state.regs[retAddrReg].where == Nowhere || */
-	    state.cfa.reg >= ARRAY_SIZE(reg_info) ||
-	    reg_info[state.cfa.reg].width != sizeof(unsigned long) ||
-	    state.cfa.offs % sizeof(unsigned long)) {
+	    state->cfa.reg >= ARRAY_SIZE(reg_info) ||
+	    reg_info[state->cfa.reg].width != sizeof(unsigned long) ||
+	    state->cfa.offs % sizeof(unsigned long)) {
 		pr_err("[vicky] failed at [%s]: %d\n", __FUNCTION__, __LINE__);
+		/* RELEASE_MEMORY(state); */
 		return -EIO;
 	}
 
+unwind:
 #if DEBUG_SANDBOX == 1
 	pr_debug("[hsuck] Register state based on the rules parsed from FDE:\n");
-	for (i = 0; i < ARRAY_SIZE(state.regs); ++i) {
+	for (i = 0; i < ARRAY_SIZE(state->regs); ++i) {
 		if (REG_INVALID(i))
 			continue;
 
-		switch (state.regs[i].where) {
+		switch (state->regs[i].where) {
 		case Nowhere:
 			break;
 		case Memory:
 			pr_debug(" x%d: c(%ld),", i,
-				state.regs[i].value * state.dataAlign);
+				state->regs[i].value * state->dataAlign);
 			break;
 		case Register:
-			pr_debug(" x%d: r(%ld),", i, state.regs[i].value);
+			pr_debug(" x%d: r(%ld),", i, state->regs[i].value);
 			break;
 		case Value:
-			pr_debug(" x%d: v(%ld),", i, state.regs[i].value);
+			pr_debug(" x%d: v(%ld),", i, state->regs[i].value);
 			break;
 		}
 	}
 #endif
 
 	if (frame->call_frame &&
-	    !UNW_DEFAULT_RA(state.regs[retAddrReg], state.dataAlign))
+	    !UNW_DEFAULT_RA(state->regs[retAddrReg], state->dataAlign))
 		frame->call_frame = 0;
 
-	cfa = FRAME_REG(state.cfa.reg, unsigned long) + state.cfa.offs;
+	cfa = FRAME_REG(state->cfa.reg, unsigned long) + state->cfa.offs;
 	startLoc = min_t(unsigned long, UNW_SP(frame), cfa);
 	endLoc = max_t(unsigned long, UNW_SP(frame), cfa);
 	pr_debug("[vicky] cfa:%lx; startLoc:%lx; endLoc:%lx\n", cfa, startLoc,
@@ -1345,53 +1380,56 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 	}
 	*/
 
-	pr_debug("[hsuck] CFA reg: %lx, offset: %lx => %lx\n", state.cfa.reg,
-		 state.cfa.offs, cfa);
+	pr_debug("[hsuck] CFA reg: %lx, offset: %lx => %lx\n", state->cfa.reg,
+		 state->cfa.offs, cfa);
 
-	for (i = 0; i < ARRAY_SIZE(state.regs); ++i) {
+	for (i = 0; i < ARRAY_SIZE(state->regs); ++i) {
 		if (REG_INVALID(i)) {
-			if (state.regs[i].where == Nowhere)
+			if (state->regs[i].where == Nowhere)
 				continue;
 			pr_err("[vicky] failed at [%s]: %d\n", __FUNCTION__,
 			       __LINE__);
+			/* RELEASE_MEMORY(state); */
 			return -EIO;
 		}
 
-		switch (state.regs[i].where) {
+		switch (state->regs[i].where) {
 		default:
 			break;
 		case Register:
-			if (state.regs[i].value >= ARRAY_SIZE(reg_info) ||
-			    	REG_INVALID(state.regs[i].value) ||
+			if (state->regs[i].value >= ARRAY_SIZE(reg_info) ||
+			    	REG_INVALID(state->regs[i].value) ||
 			    	reg_info[i].width >
-					reg_info[state.regs[i].value].width) {
+					reg_info[state->regs[i].value].width) {
 				pr_err("[vicky] failed at [%s]: %d\n",
 				       __FUNCTION__, __LINE__);
+				/* RELEASE_MEMORY(state); */
 				return -EIO;
 			}
 
-			switch (reg_info[state.regs[i].value].width) {
+			switch (reg_info[state->regs[i].value].width) {
 			case sizeof(u8):
-				state.regs[i].value = FRAME_REG(
-					state.regs[i].value, const u8);
+				state->regs[i].value = FRAME_REG(
+					state->regs[i].value, const u8);
 				break;
 			case sizeof(u16):
-				state.regs[i].value = FRAME_REG(
-					state.regs[i].value, const u16);
+				state->regs[i].value = FRAME_REG(
+					state->regs[i].value, const u16);
 				break;
 			case sizeof(u32):
-				state.regs[i].value = FRAME_REG(
-					state.regs[i].value, const u32);
+				state->regs[i].value = FRAME_REG(
+					state->regs[i].value, const u32);
 				break;
 /* #ifdef CONFIG_64BIT */
 			case sizeof(u64):
-				state.regs[i].value = FRAME_REG(
-					state.regs[i].value, const u64);
+				state->regs[i].value = FRAME_REG(
+					state->regs[i].value, const u64);
 				break;
 /* #endif */
 			default:
 				pr_err("[vicky] failed at [%s]: %d\n",
 				       __FUNCTION__, __LINE__);
+				/* RELEASE_MEMORY(state); */
 				return -EIO;
 			}
 			break;
@@ -1400,10 +1438,10 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 
 	pr_debug("[hsuck] Register state after evaluation with realtime Stack:\n");
 	fptr = (unsigned long *)(&frame->regs);
-	for (i = 0; i < ARRAY_SIZE(state.regs); ++i, fptr++) {
+	for (i = 0; i < ARRAY_SIZE(state->regs); ++i, fptr++) {
 		if (REG_INVALID(i))
 			continue;
-		switch (state.regs[i].where) {
+		switch (state->regs[i].where) {
 		case Nowhere:
 			if (reg_info[i].width != sizeof(UNW_SP(frame)) ||
 			    &FRAME_REG(i, __typeof__(UNW_SP(frame))) !=
@@ -1414,20 +1452,21 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 		case Register:
 			switch (reg_info[i].width) {
 			case sizeof(u8):
-				FRAME_REG(i, u8) = state.regs[i].value;
+				FRAME_REG(i, u8) = state->regs[i].value;
 				break;
 			case sizeof(u16):
-				FRAME_REG(i, u16) = state.regs[i].value;
+				FRAME_REG(i, u16) = state->regs[i].value;
 				break;
 			case sizeof(u32):
-				FRAME_REG(i, u32) = state.regs[i].value;
+				FRAME_REG(i, u32) = state->regs[i].value;
 				break;
 			case sizeof(u64):
-				FRAME_REG(i, u64) = state.regs[i].value;
+				FRAME_REG(i, u64) = state->regs[i].value;
 				break;
 			default:
 				pr_err("[vicky] failed at [%s]: %d\n",
 				       __FUNCTION__, __LINE__);
+				/* RELEASE_MEMORY(state); */
 				return -EIO;
 			}
 			break;
@@ -1435,15 +1474,16 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 			if (reg_info[i].width != sizeof(unsigned long)) {
 				pr_err("[vicky] failed at [%s]: %d\n",
 				       __FUNCTION__, __LINE__);
+				/* RELEASE_MEMORY(state); */
 				return -EIO;
 			}
 			FRAME_REG(i, unsigned long) =
-				cfa + state.regs[i].value * state.dataAlign;
+				cfa + state->regs[i].value * state->dataAlign;
 			break;
 		case Memory:
-			addr = cfa + state.regs[i].value * state.dataAlign;
+			addr = cfa + state->regs[i].value * state->dataAlign;
 
-			if ((state.regs[i].value * state.dataAlign) %
+			if ((state->regs[i].value * state->dataAlign) %
 				    sizeof(unsigned long) ||
 			    addr < startLoc ||
 			    addr + sizeof(unsigned long) < addr ||
@@ -1452,8 +1492,9 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 					dataAlign = %ld, addr = %lx, startLoc = %lx,\
 					endLoc = %lx\n",
 				       __FUNCTION__, __LINE__, i,
-				       state.regs[i].value, state.dataAlign,
+				       state->regs[i].value, state->dataAlign,
 				       addr, startLoc, endLoc);
+				/* RELEASE_MEMORY(state); */
 				return -EIO;
 			}
 
@@ -1476,6 +1517,7 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 			default:
 				pr_err("[vicky] failed at [%s]: %d\n",
 				       __FUNCTION__, __LINE__);
+				/* RELEASE_MEMORY(state); */
 				return -EIO;
 			}
 			break;
@@ -1483,6 +1525,7 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 		pr_debug("x%d: 0x%lx ", i, *fptr);
 	}
 	UNW_PC(frame) = frame->regs.x30;
+	/* RELEASE_MEMORY(state); */
 	return 0;
 #undef FRAME_REG
 }
@@ -1697,6 +1740,7 @@ static int find_all_branches(struct hash_table *phtable,
 	unsigned long retval;
 	unsigned long pc = UNW_PC(frame) - frame->call_frame;
 	unsigned long startLoc = 0, endLoc = 0;
+	unsigned long start_plt = 0, end_plt = 0;
 	unsigned long tableSize;
 	unsigned long temp = 0;
 	unsigned long bs_mid, bs_l, bs_r;
@@ -1719,6 +1763,11 @@ static int find_all_branches(struct hash_table *phtable,
 	pc_kern = translate_user_to_kern(kern_base, user_base, pc);
 	pr_debug("[hsuck] After translating, pc: %lx\n", pc_kern);
 
+	start_plt = table->info->plt_found ?
+			    table->info->base_address + table->info->plt_start :
+			    0;
+	end_plt = table->info->plt_found ? start_plt + table->info->plt_size :
+					   0;
 	hdr = table->header;
 	if (!hdr || hdr[0] != 1) {
 		pr_err("[vicky] failed at [%s]: %d\n", __FUNCTION__, __LINE__);
@@ -1814,7 +1863,7 @@ static int find_all_branches(struct hash_table *phtable,
 				 read_pointer(&ptr,
 					      (const u8 *)(fde + 1) + *fde,
 					      ptrType, kern_base, user_base);
-			if (pc_kern >= endLoc || pc_kern < startLoc) {
+			if (pc_kern > endLoc || pc_kern < startLoc) {
 				pr_err("[vicky] failed at [%s]: %d, "
 				       "startLoc = %lx, pc = %lx, endLoc = %lx\n",
 				       __FUNCTION__, __LINE__,
@@ -1858,7 +1907,8 @@ static int find_all_branches(struct hash_table *phtable,
 				switch (extract32(insn, 21, 4)) {
 				case 0:
 					pr_debug("[hsuck] br insn\n");
-					break;
+					retval = 1;
+					goto loop_end;
 				case 1:
 					pr_debug("[hsuck] blr insn\n");
 					goto loop_end;
@@ -1872,10 +1922,20 @@ static int find_all_branches(struct hash_table *phtable,
 			}
 
 			b_target = disas_b_insns(frame, addr, insn);
-			pr_debug("[hsuck] branch target=%#0lx\n", b_target);
+			pr_debug("[hsuck] addr=%#0lx, branch target=%#0lx\n",
+				addr, b_target);
 			/* In same function */
 			if (b_target >= startLoc && b_target < endLoc)
 				goto loop_end;
+
+			if (b_target >= start_plt && b_target < end_plt) {
+				pr_debug("[hsuck] the plt of %s [%#0lx-%#0lx]\n",
+					table->info->name, start_plt, end_plt);
+				pr_debug("[hsuck] addr=%#0lx, insn=%#0x,"
+					 " type=%#0x, branch target=%#0lx\n",
+					 addr, insn, insn_type, b_target);
+				b_target = extract_target_from_plt(b_target);
+			}
 
 			if (b_target == entry_point) {
 				pr_debug("[hsuck] found correct branch: "
@@ -1984,11 +2044,18 @@ static int callsite_checking(struct hash_table *phtable,
 find_b:
 		temp = UNW_PC(frame);
 		UNW_PC(frame) = addr;
-		retval = find_all_branches(phtable, frame, entry_point, 3);
+		retval = find_all_branches(phtable, frame, entry_point, 4);
 		UNW_PC(frame) = temp;
+
 		if (!retval)
 			goto out_print_suc;
-		else
+		else if (retval == 1) {
+			pr_debug("[hsuck] fucking br...\n");
+			pr_debug("[hsuck] %d: addr=%#0lx, target=%#0lx, entry=%#0lx\n",
+				__LINE__, UNW_PC(frame) - 4, bl_target,
+				entry_point);
+			goto out_print_suc;
+		} else
 			goto out_print_err;
 	}
 out:
@@ -2011,12 +2078,15 @@ int delta_enforce_verification(struct hash_table *phtable,
 			       struct unwind_frame_info *frame)
 {
 	int retval;
+	int i = 0;
+	unsigned long prev_pc = 0;
 
 	if (!delta_app_inlist)
 		delta_app_inlist = (void *)__kallsyms_lookup_name("delta_app_inlist");	
 
 	/* Unwinding until reach main() */
-	while (1) {
+	while (true) {
+		prev_pc = UNW_PC(frame);
 		retval = delta_unwind(phtable, frame);
 		if (retval == -EINVAL || retval == -EIO || retval == -EFAULT) {
 			/* Abort the process */
@@ -2030,16 +2100,31 @@ int delta_enforce_verification(struct hash_table *phtable,
 			pr_debug("[hsuck] unwinding sucessfully reached main: %#0lx\n",
 				 frame->entry_point);
 			break;
-		} else if (retval == 2 && delta_app_inlist(current->parent)) {
+		} else if (retval == 2 &&
+			   delta_app_inlist(current->parent->comm)) {
 			pr_debug("[hsuck] unwinding sucessfully reached __clone: %#0lx\n",
 				 frame->entry_point);
+			break;
+		} else if (retval == 3 &&
+			   delta_app_inlist(current->parent->comm)) {
+			pr_debug("[hsuck] unwinding sucessfully reached child_main: %#0lx\n",
+				 frame->entry_point);
+			break;
+		} else if (UNW_PC(frame) == prev_pc) {
+			pr_err("[hsuck] %s, L%d: pc: %lx, sp: %lx\n",
+			       __FUNCTION__, __LINE__, UNW_PC(frame),
+			       UNW_SP(frame));
 			break;
 		}
 
 		retval = callsite_checking(phtable, frame);
-		/* if (retval == -1) */
-		/* 	break; */
+		i++;
 	}
+	pr_debug("[hsuck] the length of entire call stack=%d\n", i);
+	/* if (i == 60) { */
+	/* 	pr_err("[hsuck] %s, pid: %d, pc: %lx, sp: %lx\n", __FUNCTION__, */
+	/* 	       current->pid, UNW_PC(frame), UNW_SP(frame)); */
+	/* } */
 	return retval;
 }
 EXPORT_SYMBOL(delta_enforce_verification);

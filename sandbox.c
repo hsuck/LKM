@@ -27,34 +27,23 @@
 #define IOCTL_ENABLE_UNWIND _IO(MAGIC, 1)
 #define IOCTL_DISABLE_UNWIND _IO(MAGIC, 2)
 
-#define NR_SYS_OPEN       0x005
-#define NR_SYS_OPENAT     0x038
-#define NR_SYS_EXECVE     0x0dd
-#define NR_SYS_EXECVEAT   0x119
-#define NR_SYS_ACCEPT     0x0ca
-#define NR_SYS_SOCKET     0x029
-#define NR_SYS_CONNECT    0x02a
-#define NR_SYS_EXIT       0x05d
-#define NR_SYS_EXIT_GROUP 0x05e
-#define NR_SYS_CLONE      0x0dc
-
 #define MAX_NAME 50
 
 #define ELFOSABI_ARM_FDPIC 65 /* ARM FDPIC platform */
 #define elf_check_fdpic(x) ((x)->e_ident[EI_OSABI] == ELFOSABI_ARM_FDPIC)
 
 #define CLONE_ENTRY 0xea5d0
+#define CHILD_MAIN  0x83ffc
 
-char hook_app[MAX_NAME]  = "test1";
-char hook_app2[MAX_NAME] = "httpd";
-char hook_app3[MAX_NAME] = "netserver";
+char *hook_apps[] = {"httpd", "nginx", "sqlite-bench"};
 
 typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 kallsyms_lookup_name_t __kallsyms_lookup_name;
 
 static int syscall_hooked = 0;
 static unsigned long *__sys_call_table;
-spinlock_t sandbox_lock;
+spinlock_t sandbox_spinlock;
+struct mutex sandbox_mutex;
 
 void (*update_mapping_prot)(phys_addr_t phys, unsigned long virt,
 			    phys_addr_t size, pgprot_t prot);
@@ -64,9 +53,13 @@ struct vm_area_struct *(*__find_vma_prev)(struct mm_struct *mm,
 struct task_struct *(*__find_get_task_by_vpid)(pid_t nr);
 
 typedef asmlinkage long (*sys_call_t)(const struct pt_regs *);
-static sys_call_t orig_open, orig_openat, orig_execve, orig_execveat,
-	orig_accept, orig_accept, orig_socket, orig_connect, orig_exit,
-	orig_exit_group, orig_clone;
+static sys_call_t orig_openat, orig_read, orig_write, orig_recvfrom,
+	orig_sendfile, orig_readv, orig_writev;
+static sys_call_t orig_execve, orig_execveat, orig_clone;
+static sys_call_t orig_mprotect, orig_mmap, orig_mremap;
+static sys_call_t orig_socket, orig_bind, orig_connect, orig_listen,
+	orig_accept, orig_accept4;
+static sys_call_t orig_exit, orig_exit_group;
 
 extern table_t *unwind_add_table(struct hash_table *, const struct so_info *);
 extern void init_unwind_table(struct hash_table *, struct unwind_frame_info *);
@@ -79,15 +72,12 @@ DECLARE_HASHTABLE(proc_htable, 16);
 static struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
 
 // TODO: ztex, we should make the app list an array
-int delta_app_inlist(struct task_struct *tsk)
+inline int delta_app_inlist(const char *task_comm)
 {
-	char task_comm[TASK_COMM_LEN];
-	get_task_comm(task_comm, tsk);
-
-	if (strcmp(task_comm, hook_app) == 0 ||
-	    strcmp(task_comm, hook_app2) == 0 ||
-	    strcmp(task_comm, hook_app3) == 0) {
-		return 1;
+	int i;
+	for (i = 0; i < 3; ++i) {
+		if (!strcmp(task_comm, hook_apps[i]))
+			return 1;
 	}
 	return 0;
 }
@@ -110,6 +100,7 @@ static int open_by_self(unsigned long pc)
 {
 	/* FIXME hsuck: may need more aliases*/
 	char *ldname = "ld-linux-aarch64.so.1";
+	char *rtlib = "librtlib.so";
 	struct so_info *cur;
 	struct hash_table *phtable = search_htable(current->comm, current->pid);
 
@@ -125,6 +116,13 @@ static int open_by_self(unsigned long pc)
 		 __FUNCTION__, __LINE__, pc, cur->base_address,
 		 cur->base_address + cur->pc_range);
 	if (pc >= cur->base_address && pc < cur->base_address + cur->pc_range)
+		return 0;
+
+	cur = search_item(phtable, rtlib);
+	if (!cur)
+		return 1;
+
+	if (pc >= cur->base_address && pc < cur->base_address + cur->pc_range) 
 		return 0;
 
 	return 1;
@@ -393,7 +391,7 @@ static int is_all_filled(void)
 }
 
 /* FIXME hsuck: may need to replace with SHA256 or other hash function? */
-static u32 myhash(const char *s)
+inline static u32 myhash(const char *s)
 {
 	u32 key = 0;
 	char c;
@@ -570,7 +568,7 @@ out_free_item:
 	goto out;
 }
 
-static void fill_clone_entry(void)
+static void fill_child_entry(void)
 {
 	struct hash_table *phtable;
 	struct so_info *item;
@@ -580,7 +578,8 @@ static void fill_clone_entry(void)
 	if (!phtable || hash_empty(phtable->htable))
 		return;
 
-	if (phtable->clone_entry)
+	if (phtable->clone_entry &&
+	    (phtable->child_main /*|| phtable->ngx_spawn_process*/))
 		return;
 
 	item = search_item(phtable, libname);
@@ -591,6 +590,18 @@ static void fill_clone_entry(void)
 
 	phtable->clone_entry = item->base_address + CLONE_ENTRY;
 	pr_debug("[hsuck] clone entry: %#0lx\n", phtable->clone_entry);
+
+	item = search_item(phtable, current->comm);
+	if (!item) {
+		pr_debug("[hsuck] %s: %s is not found\n", __FUNCTION__,
+			 current->comm);
+		return;
+	}
+
+	if (!strcmp("httpd", current->comm)) {
+		phtable->child_main = item->base_address + CHILD_MAIN;
+		pr_debug("[hsuck] child_main: %#0lx\n", phtable->child_main);
+	}
 
 	return;
 }
@@ -604,20 +615,23 @@ static void syscall_protection(void)
 		 current->comm, current->pid, current->real_parent->comm,
 		 current->real_parent->pid);
 
+	mutex_lock(&sandbox_mutex);
+	mutex_unlock(&sandbox_mutex);
 	switch (is_all_filled()) {
 	case 0:
 		pr_debug("[hsuck] have not filled\n");
 		do {
 			retval = traverse_vma(0);
 		} while (retval == -EAGAIN);
+		fill_child_entry();
 		break;
 	case -1:
-		pr_err("[hsuck] %s, %d: hash table is NULL or no entries\n",
-		       __FUNCTION__, __LINE__);
+		pr_err("[hsuck] %s, %d: hash table[%s, %d] is NULL or no entries\n",
+		       __FUNCTION__, __LINE__, current->comm,
+		       task_pid_nr(current));
 		goto out;
 	case 1:
 		pr_debug("[hsuck] have filled\n");
-		fill_clone_entry();
 		break;
 	default:
 		break;
@@ -640,6 +654,7 @@ static void syscall_protection(void)
 	}
 
 	unwind_stack();
+
 out:
 	return;
 }
@@ -876,7 +891,7 @@ static void lib_fetch_ehframe(const char *libname, struct file *libfile,
 	struct so_info *cur;
 	char *buf, *p;
 	char libpath[128] = "/usr/lib/";
-	char rpath[0x100] = "/home/hsuck/PAC-experiment/httpd-2.4.58-pac/root/lib/";
+	char rpath[0x100] = "/home/hsuck/PAC-experiment/httpd-2.4.58-vanilla/root/lib/";
 
 	if ((!libname && !libfile) || !phtable)
 		return;
@@ -884,14 +899,14 @@ static void lib_fetch_ehframe(const char *libname, struct file *libfile,
 	if (!libname)
 		goto fetch_ehframe;
 
-	strcat(libpath, libname);
-	file = filp_open(libpath, O_RDONLY | O_LARGEFILE, 0);
+	strcat(rpath, libname);
+	file = filp_open(rpath, O_RDONLY | O_LARGEFILE, 0);
 	if (IS_ERR(file)) {
-		pr_debug("[hsuck] open %s failed\n", libpath);
-		strcat(rpath, libname);
-		file = filp_open(rpath, O_RDONLY | O_LARGEFILE, 0);
+		pr_debug("[hsuck] open %s failed\n", rpath);
+		strcat(libpath, libname);
+		file = filp_open(libpath, O_RDONLY | O_LARGEFILE, 0);
 		if (IS_ERR(file)) {
-			pr_err("[hsuck] open %s failed\n", rpath);
+			pr_err("[hsuck] open %s failed\n", libname);
 			return;
 		}
 	}
@@ -967,26 +982,81 @@ loop_end:
 	return;
 }
 
-asmlinkage long hacked_open(const struct pt_regs *pt_regs)
-{
-	if (delta_app_inlist(current)) {
-		pr_debug("[vicky] syscall `open` is hooked, "
-			 "%s(%d)\n",
-			 current->comm, task_pid_nr(current));
-		syscall_protection();
-	}
-	return orig_open(pt_regs);
-}
-
 asmlinkage long hacked_openat(const struct pt_regs *pt_regs)
 {
-	if (delta_app_inlist(current)) {
+	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `openat` is hooked, "
 			 "%s(%d)\n",
 			 current->comm, task_pid_nr(current));
 		syscall_protection();
 	}
 	return orig_openat(pt_regs);
+}
+
+asmlinkage long hacked_read(const struct pt_regs *pt_regs)
+{
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `read` is hooked, "
+			 "%s(%d)\n",
+			 current->comm, task_pid_nr(current));
+		syscall_protection();
+	}
+	return orig_read(pt_regs);
+}
+
+asmlinkage long hacked_write(const struct pt_regs *pt_regs)
+{
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `write` is hooked, "
+			 "%s(%d)\n",
+			 current->comm, task_pid_nr(current));
+		syscall_protection();
+	}
+	return orig_write(pt_regs);
+}
+
+asmlinkage long hacked_readv(const struct pt_regs *pt_regs)
+{
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `readv` is hooked, "
+			 "%s(%d)\n",
+			 current->comm, task_pid_nr(current));
+		syscall_protection();
+	}
+	return orig_readv(pt_regs);
+}
+
+asmlinkage long hacked_writev(const struct pt_regs *pt_regs)
+{
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `writev` is hooked, "
+			 "%s(%d)\n",
+			 current->comm, task_pid_nr(current));
+		syscall_protection();
+	}
+	return orig_writev(pt_regs);
+}
+
+asmlinkage long hacked_sendfile(const struct pt_regs *pt_regs)
+{
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `sendfile` is hooked, "
+			 "%s(%d)\n",
+			 current->comm, task_pid_nr(current));
+		syscall_protection();
+	}
+	return orig_sendfile(pt_regs);
+}
+
+asmlinkage long hacked_recvfrom(const struct pt_regs *pt_regs)
+{
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `recvfrom` is hooked, "
+			 "%s(%d)\n",
+			 current->comm, task_pid_nr(current));
+		syscall_protection();
+	}
+	return orig_recvfrom(pt_regs);
 }
 
 asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
@@ -1018,8 +1088,9 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 	}
 	pr_debug("[hsuck] filename: %s\n", filepath);
 
-	if (strcmp(hook_app2, kbasename(filepath)) != 0)
+	if (!delta_app_inlist(kbasename(filepath)))
 		goto out;
+	pr_info("[hsuck] monitoring %s\n", kbasename(filepath));
 
 	pr_debug("[vicky] syscall `execve` is hooked, "
 		 "%s(%d)\n",
@@ -1044,8 +1115,8 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 		goto out;
 
 	/* First of all, some simple consistency checks */
-	if (elf_ex.e_type != ET_DYN)
-		goto out;
+	/* if (elf_ex.e_type != ET_DYN) */
+	/* 	goto out; */
 	if (!elf_check_arch(&elf_ex))
 		goto out;
 	if (elf_check_fdpic(&elf_ex))
@@ -1175,10 +1246,14 @@ out_free_strtab:
 out_free_shdata:
 	RELEASE_MEMORY(elf_shdata);
 
-	if (delta_app_inlist(current))
+	if (delta_app_inlist(current->comm))
 		syscall_protection();
 out:
-	return orig_execve(pt_regs);
+	retval = orig_execve(pt_regs);
+	if (elf_ex.e_type != ET_DYN)
+		while (traverse_vma(0) == -EAGAIN)
+			;
+	return retval;
 }
 
 asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
@@ -1210,7 +1285,7 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 	}
 	pr_debug("[hsuck] filename: %s\n", filepath);
 
-	if (strcmp(hook_app2, kbasename(filepath)) != 0)
+	if (!delta_app_inlist(kbasename(filepath)))
 		goto out;
 
 	pr_debug("[vicky] syscall `execveat` is hooked, "
@@ -1236,8 +1311,6 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 		goto out;
 
 	/* First of all, some simple consistency checks */
-	if (elf_ex.e_type != ET_DYN)
-		goto out;
 	if (!elf_check_arch(&elf_ex))
 		goto out;
 	if (elf_check_fdpic(&elf_ex))
@@ -1368,26 +1441,52 @@ out_free_strtab:
 out_free_shdata:
 	RELEASE_MEMORY(elf_shdata);
 
-	if (delta_app_inlist(current))
+	if (delta_app_inlist(current->comm))
 		syscall_protection();
 out:
-	return orig_execveat(pt_regs);
+	retval = orig_execve(pt_regs);
+	if (elf_ex.e_type != ET_DYN)
+		while (traverse_vma(0) == -EAGAIN)
+			;
+	return retval;
 }
 
-asmlinkage long hacked_accept(const struct pt_regs *pt_regs)
+asmlinkage long hacked_mprotect(const struct pt_regs *pt_regs)
 {
-	if (delta_app_inlist(current)) {
-		pr_debug("[vicky] syscall `accept` is hooked, "
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `mprotect` is hooked, "
 			"%s(%d)\n",
 			current->comm, task_pid_nr(current));
 		syscall_protection();
 	}
-	return orig_accept(pt_regs);
+	return orig_mprotect(pt_regs);
+}
+
+asmlinkage long hacked_mmap(const struct pt_regs *pt_regs)
+{
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `mmap` is hooked, "
+			"%s(%d)\n",
+			current->comm, task_pid_nr(current));
+		syscall_protection();
+	}
+	return orig_mmap(pt_regs);
+}
+
+asmlinkage long hacked_mremap(const struct pt_regs *pt_regs)
+{
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `mremap` is hooked, "
+			 "%s(%d)\n",
+			 current->comm, task_pid_nr(current));
+		syscall_protection();
+	}
+	return orig_mremap(pt_regs);
 }
 
 asmlinkage long hacked_socket(const struct pt_regs *pt_regs)
 {
-	if (delta_app_inlist(current)) {
+	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `socket` is hooked, "
 			"%s(%d)\n",
 			current->comm, task_pid_nr(current));
@@ -1396,9 +1495,20 @@ asmlinkage long hacked_socket(const struct pt_regs *pt_regs)
 	return orig_socket(pt_regs);
 }
 
+asmlinkage long hacked_bind(const struct pt_regs *pt_regs)
+{
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `bind` is hooked, "
+			"%s(%d)\n",
+			current->comm, task_pid_nr(current));
+		syscall_protection();
+	}
+	return orig_bind(pt_regs);
+}
+
 asmlinkage long hacked_connect(const struct pt_regs *pt_regs)
 {
-	if (delta_app_inlist(current)) {
+	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `connect` is hooked, "
 			"%s(%d)\n",
 			current->comm, task_pid_nr(current));
@@ -1407,12 +1517,46 @@ asmlinkage long hacked_connect(const struct pt_regs *pt_regs)
 	return orig_connect(pt_regs);
 }
 
+asmlinkage long hacked_listen(const struct pt_regs *pt_regs)
+{
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `listen` is hooked, "
+			"%s(%d)\n",
+			current->comm, task_pid_nr(current));
+		syscall_protection();
+	}
+	return orig_listen(pt_regs);
+}
+
+asmlinkage long hacked_accept(const struct pt_regs *pt_regs)
+{
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `accept` is hooked, "
+			"%s(%d)\n",
+			current->comm, task_pid_nr(current));
+		syscall_protection();
+	}
+	return orig_accept(pt_regs);
+}
+
+asmlinkage long hacked_accept4(const struct pt_regs *pt_regs)
+{
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `accept4` is hooked, "
+			"%s(%d)\n",
+			current->comm, task_pid_nr(current));
+		syscall_protection();
+	}
+	return orig_accept4(pt_regs);
+}
+
 static void copy_table(table_t *ptable, table_t *ctable)
 {
-	ctable->address = ptable->address;
-	ctable->size    = ptable->size;
-	ctable->header  = ptable->header;
-	ctable->hdrsz   = ptable->hdrsz;
+	ctable->address     = ptable->address;
+	ctable->size        = ptable->size;
+	ctable->header      = ptable->header;
+	ctable->hdrsz       = ptable->hdrsz;
+	ctable->state_cache = ptable->state_cache;
 	get_task_comm(ctable->name, current);
 
 	return;
@@ -1427,19 +1571,27 @@ asmlinkage long hacked_clone(const struct pt_regs *pt_regs)
 	struct hash_table *pphtable, *cphtable;
 	struct so_info *cur, *item;
 
-	retval = orig_clone(pt_regs);
+	if (delta_app_inlist(current->comm)) {
+		pr_debug("[vicky] syscall `clone` is hooked, "
+			"%s(%d)\n",
+			current->comm, task_pid_nr(current));
+		syscall_protection();
+	}
 
+	mutex_lock(&sandbox_mutex);
+	retval = orig_clone(pt_regs);
 	/* task_struct of child */
 	t = pid_task(find_vpid(retval), PIDTYPE_PID);
-	if (!t)
+	if (!t) {
 		pr_err("[hsuck] can not find child task by pid(%ld)\n", retval);
+		goto out;
+	}
 
-	if (delta_app_inlist(current) && !strcmp(current->comm, t->comm)) {
+	if (delta_app_inlist(current->comm) && !strcmp(current->comm, t->comm)) {
 		pr_debug("[vicky] syscall `clone` is hooked, "
 			 "%s, pid=%d, cpid=%d\n",
 			 current->comm, task_pid_nr(current), task_pid_nr(t));
 
-		spin_lock(&sandbox_lock);
 		/* Find hash table of parent */
 		if (!(pphtable = search_htable(current->comm, current->pid))) {
 			pr_err("[hsuck] %s, %d: %s, %d htable not found\n",
@@ -1517,19 +1669,21 @@ asmlinkage long hacked_clone(const struct pt_regs *pt_regs)
 		}
 
 copy_htable:
-		cphtable->elf_entry       = pphtable->elf_entry;
-		cphtable->clone_entry     = pphtable->clone_entry;
-		cphtable->elf_entry_found = pphtable->elf_entry_found;
-		cphtable->cntr            = pphtable->cntr;
+		cphtable->elf_entry         = pphtable->elf_entry;
+		cphtable->clone_entry       = pphtable->clone_entry;
+		cphtable->child_main        = pphtable->child_main;
+		/* cphtable->ngx_spawn_process = pphtable->ngx_spawn_process; */
+		cphtable->elf_entry_found   = pphtable->elf_entry_found;
+		cphtable->cntr              = pphtable->cntr;
 
-		/* pr_info("[hsuck] cntr: %s, %d\n", pphtable->name, */
+		/* pr_debug("[hsuck] cntr: %s, %d\n", pphtable->name, */
 		/* 	atomic_inc_return(pphtable->cntr)); */
-		atomic_inc_return(pphtable->cntr);
-		spin_unlock(&sandbox_lock);
+		atomic_inc(pphtable->cntr);
 		pr_debug("[hsuck] copy metadata successfully from %d to %d\n",
 			 task_pid_nr(current), task_pid_nr(t));
 	}
 out:
+	mutex_unlock(&sandbox_mutex);
 	return retval;
 }
 
@@ -1576,6 +1730,7 @@ static void release_memory(void)
 	int retval;
 	struct hash_table *phtable = search_htable(current->comm, current->pid);
 
+	mutex_lock(&sandbox_mutex);
 	if (!phtable) {
 		pr_err("[hsuck] %s:%d %s:%d htable not found\n", __FUNCTION__,
 		       __LINE__, current->comm, current->pid);
@@ -1595,12 +1750,13 @@ static void release_memory(void)
 	else
 		release_partial();
 out:
+	mutex_unlock(&sandbox_mutex);
 	return;
 }
 
 asmlinkage long hacked_exit(const struct pt_regs *pt_regs)
 {
-	if (delta_app_inlist(current)) {
+	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `exit` is hooked, "
 			 "%s(%d)\n",
 			 current->comm, task_pid_nr(current));
@@ -1611,7 +1767,7 @@ asmlinkage long hacked_exit(const struct pt_regs *pt_regs)
 
 asmlinkage long hacked_exit_group(const struct pt_regs *pt_regs)
 {
-	if (delta_app_inlist(current)) {
+	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `exit_group` is hooked, "
 			 "%s(%d)\n",
 			 current->comm, task_pid_nr(current));
@@ -1622,49 +1778,98 @@ asmlinkage long hacked_exit_group(const struct pt_regs *pt_regs)
 
 static int __hook_syscall(void)
 {
-	orig_open       = (sys_call_t)__sys_call_table[NR_SYS_OPEN];
-	orig_openat     = (sys_call_t)__sys_call_table[NR_SYS_OPENAT];
-	orig_execve     = (sys_call_t)__sys_call_table[NR_SYS_EXECVE];
-	orig_execveat   = (sys_call_t)__sys_call_table[NR_SYS_EXECVEAT];
-	orig_accept     = (sys_call_t)__sys_call_table[NR_SYS_ACCEPT];
-	orig_socket     = (sys_call_t)__sys_call_table[NR_SYS_SOCKET];
-	orig_connect    = (sys_call_t)__sys_call_table[NR_SYS_CONNECT];
-	orig_exit       = (sys_call_t)__sys_call_table[NR_SYS_EXIT];
-	orig_exit_group = (sys_call_t)__sys_call_table[NR_SYS_EXIT_GROUP];
-	orig_clone      = (sys_call_t)__sys_call_table[NR_SYS_CLONE];
-	__sys_call_table[NR_SYS_OPEN]       = (unsigned long)hacked_open;
-	__sys_call_table[NR_SYS_OPENAT]     = (unsigned long)hacked_openat;
-	__sys_call_table[NR_SYS_EXECVE]     = (unsigned long)hacked_execve;
-	__sys_call_table[NR_SYS_EXECVEAT]   = (unsigned long)hacked_execveat;
-	__sys_call_table[NR_SYS_ACCEPT]     = (unsigned long)hacked_accept;
-	__sys_call_table[NR_SYS_SOCKET]     = (unsigned long)hacked_socket;
-	__sys_call_table[NR_SYS_CONNECT]    = (unsigned long)hacked_connect;
-	__sys_call_table[NR_SYS_EXIT]       = (unsigned long)hacked_exit;
-	__sys_call_table[NR_SYS_EXIT_GROUP] = (unsigned long)hacked_exit_group;
-	__sys_call_table[NR_SYS_CLONE]      = (unsigned long)hacked_clone;
+	/* File system related */
+	orig_openat     = (sys_call_t)__sys_call_table[__NR_openat];
+	orig_read       = (sys_call_t)__sys_call_table[__NR_read];
+	orig_write      = (sys_call_t)__sys_call_table[__NR_write];
+	orig_readv      = (sys_call_t)__sys_call_table[__NR_readv];
+	orig_writev     = (sys_call_t)__sys_call_table[__NR_writev];
+	orig_sendfile   = (sys_call_t)__sys_call_table[__NR_sendfile];
+	orig_recvfrom   = (sys_call_t)__sys_call_table[__NR_recvfrom];
+	/* Arbitrary Code Execution */
+	orig_execve     = (sys_call_t)__sys_call_table[__NR_execve];
+	orig_execveat   = (sys_call_t)__sys_call_table[__NR_execveat];
+	orig_clone      = (sys_call_t)__sys_call_table[__NR_clone];
+	/* Memory Permissions */
+	orig_mprotect   = (sys_call_t)__sys_call_table[__NR_mprotect];
+	orig_mmap       = (sys_call_t)__sys_call_table[__NR_mmap];
+	orig_mremap     = (sys_call_t)__sys_call_table[__NR_mremap];
+	/* Networking */
+	orig_socket     = (sys_call_t)__sys_call_table[__NR_socket];
+	orig_bind       = (sys_call_t)__sys_call_table[__NR_bind];
+	orig_connect    = (sys_call_t)__sys_call_table[__NR_connect];
+	orig_listen     = (sys_call_t)__sys_call_table[__NR_listen];
+	orig_accept     = (sys_call_t)__sys_call_table[__NR_accept];
+	orig_accept4    = (sys_call_t)__sys_call_table[__NR_accept4];
+	/* Others */
+	orig_exit       = (sys_call_t)__sys_call_table[__NR_exit];
+	orig_exit_group = (sys_call_t)__sys_call_table[__NR_exit_group];
+
+	/* File system related */
+	__sys_call_table[__NR_openat]     = (unsigned long)hacked_openat;
+	__sys_call_table[__NR_read]       = (unsigned long)hacked_read;
+	__sys_call_table[__NR_write]      = (unsigned long)hacked_write;
+	__sys_call_table[__NR_readv]      = (unsigned long)hacked_readv;
+	__sys_call_table[__NR_writev]     = (unsigned long)hacked_writev;
+	__sys_call_table[__NR_sendfile]   = (unsigned long)hacked_sendfile;
+	__sys_call_table[__NR_recvfrom]   = (unsigned long)hacked_recvfrom;
+	/* Arbitrary Code Execution */
+	__sys_call_table[__NR_execve]     = (unsigned long)hacked_execve;
+	__sys_call_table[__NR_execveat]   = (unsigned long)hacked_execveat;
+	__sys_call_table[__NR_clone]      = (unsigned long)hacked_clone;
+	/* Memory Permissions */
+	__sys_call_table[__NR_mprotect]   = (unsigned long)hacked_mprotect;
+	__sys_call_table[__NR_mmap]       = (unsigned long)hacked_mmap;
+	__sys_call_table[__NR_mremap]     = (unsigned long)hacked_mremap;
+	/* Networking */
+	__sys_call_table[__NR_socket]     = (unsigned long)hacked_socket;
+	__sys_call_table[__NR_bind]       = (unsigned long)hacked_bind;
+	__sys_call_table[__NR_connect]    = (unsigned long)hacked_connect;
+	__sys_call_table[__NR_listen]     = (unsigned long)hacked_listen;
+	__sys_call_table[__NR_accept]     = (unsigned long)hacked_accept;
+	__sys_call_table[__NR_accept4]    = (unsigned long)hacked_accept4;
+	/* Others */
+	__sys_call_table[__NR_exit]       = (unsigned long)hacked_exit;
+	__sys_call_table[__NR_exit_group] = (unsigned long)hacked_exit_group;
 	pr_debug("[ztex] success to overwrite __sys_call_table\n");
 	return 0;
 }
 
 static void __unhook_syscall(void)
 {
-	__sys_call_table[NR_SYS_OPEN]       = (unsigned long)orig_open;
-	__sys_call_table[NR_SYS_OPENAT]     = (unsigned long)orig_openat;
-	__sys_call_table[NR_SYS_EXECVE]     = (unsigned long)orig_execve;
-	__sys_call_table[NR_SYS_EXECVEAT]   = (unsigned long)orig_execveat;
-	__sys_call_table[NR_SYS_ACCEPT]     = (unsigned long)orig_accept;
-	__sys_call_table[NR_SYS_SOCKET]     = (unsigned long)orig_socket;
-	__sys_call_table[NR_SYS_CONNECT]    = (unsigned long)orig_connect;
-	__sys_call_table[NR_SYS_EXIT]       = (unsigned long)orig_exit;
-	__sys_call_table[NR_SYS_EXIT_GROUP] = (unsigned long)orig_exit_group;
-	__sys_call_table[NR_SYS_CLONE]      = (unsigned long)orig_clone;
+	/* File system related */
+	__sys_call_table[__NR_openat]     = (unsigned long)orig_openat;
+	__sys_call_table[__NR_read]       = (unsigned long)orig_read;
+	__sys_call_table[__NR_write]      = (unsigned long)orig_write;
+	__sys_call_table[__NR_readv]      = (unsigned long)orig_readv;
+	__sys_call_table[__NR_writev]     = (unsigned long)orig_writev;
+	__sys_call_table[__NR_sendfile]   = (unsigned long)orig_sendfile;
+	__sys_call_table[__NR_recvfrom]   = (unsigned long)orig_recvfrom;
+	/* Arbitrary Code Execution */
+	__sys_call_table[__NR_execve]     = (unsigned long)orig_execve;
+	__sys_call_table[__NR_execveat]   = (unsigned long)orig_execveat;
+	__sys_call_table[__NR_clone]      = (unsigned long)orig_clone;
+	/* Memory Permissions */
+	__sys_call_table[__NR_mprotect]   = (unsigned long)orig_mprotect;
+	__sys_call_table[__NR_mmap]       = (unsigned long)orig_mmap;
+	__sys_call_table[__NR_mremap]     = (unsigned long)orig_mremap;
+	/* Networking */
+	__sys_call_table[__NR_socket]     = (unsigned long)orig_socket;
+	__sys_call_table[__NR_bind]       = (unsigned long)orig_bind;
+	__sys_call_table[__NR_connect]    = (unsigned long)orig_connect;
+	__sys_call_table[__NR_listen]     = (unsigned long)orig_listen;
+	__sys_call_table[__NR_accept]     = (unsigned long)orig_accept;
+	__sys_call_table[__NR_accept4]    = (unsigned long)orig_accept4;
+	/* Others */
+	__sys_call_table[__NR_exit]       = (unsigned long)orig_exit;
+	__sys_call_table[__NR_exit_group] = (unsigned long)orig_exit_group;
 }
 
 static int hook_syscall(void)
 {
 	int ret = 0;
 
-	spin_lock(&sandbox_lock);
+	spin_lock(&sandbox_spinlock);
 	if (syscall_hooked == 0) {
 		pr_debug("[ztex] try to overwrite __sys_calltable\n");
 		ret = __hook_syscall();
@@ -1673,7 +1878,7 @@ static int hook_syscall(void)
 		__unhook_syscall();
 		syscall_hooked = 0;
 	}
-	spin_unlock(&sandbox_lock);
+	spin_unlock(&sandbox_spinlock);
 
 	return ret;
 }
@@ -1720,23 +1925,23 @@ static long rootkit_ioctl(struct file *filp, unsigned int ioctl,
 			  unsigned long arg)
 {
 	pr_debug("[hsuck] %s\n", __FUNCTION__);
-	switch (ioctl) {
-	case IOCTL_DISABLE_UNWIND:
-		pr_debug("[vicky] Unwind is disabled\n");
-		memset(hook_app, 0, MAX_NAME);
-		memset(hook_app2, 0, MAX_NAME);
-		memset(hook_app3, 0, MAX_NAME);
-		break;
-	case IOCTL_ENABLE_UNWIND:
-		pr_debug("[vicky] Unwind is enabled\n");
-		strncpy(hook_app, "test1", 5);
-		strncpy(hook_app2, "httpd", 5);
-		strncpy(hook_app3, "netserver", 9);
-		break;
-	default:
-		pr_debug("[vicky] ioctl illegal command\n");
-		break;
-	}
+	/* switch (ioctl) { */
+	/* case IOCTL_DISABLE_UNWIND: */
+	/* 	pr_debug("[vicky] Unwind is disabled\n"); */
+	/* 	memset(hook_app, 0, MAX_NAME); */
+	/* 	memset(hook_app2, 0, MAX_NAME); */
+	/* 	memset(hook_app3, 0, MAX_NAME); */
+	/* 	break; */
+	/* case IOCTL_ENABLE_UNWIND: */
+	/* 	pr_debug("[vicky] Unwind is enabled\n"); */
+	/* 	strncpy(hook_app, "test1", 5); */
+	/* 	strncpy(hook_app2, "httpd", 5); */
+	/* 	strncpy(hook_app3, "netserver", 9); */
+	/* 	break; */
+	/* default: */
+	/* 	pr_debug("[vicky] ioctl illegal command\n"); */
+	/* 	break; */
+	/* } */
 	return 0;
 }
 
@@ -1762,7 +1967,8 @@ static int __init sandbox_init(void)
 		pr_err("[hsuck] misc_register failed, ret = %d\n", ret);
 
 	pr_info("[vicky] successfully init %s\n", OURMODNAME);
-	spin_lock_init(&sandbox_lock);
+	spin_lock_init(&sandbox_spinlock);
+	mutex_init(&sandbox_mutex);
 
 	register_kprobe(&kp);
 	__kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
@@ -1783,12 +1989,12 @@ static int __init sandbox_init(void)
 
 static void __exit sandbox_exit(void)
 {
-	spin_lock(&sandbox_lock);
+	spin_lock(&sandbox_spinlock);
 	if (syscall_hooked == 1) {
 		__unhook_syscall();
 		syscall_hooked = 0;
 	}
-	spin_unlock(&sandbox_lock);
+	spin_unlock(&sandbox_spinlock);
 
 	pr_info("[vicky] %s: removed\n", OURMODNAME);
 	misc_deregister(&sandbox);
