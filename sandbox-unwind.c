@@ -1,7 +1,7 @@
 #include <linux/printk.h>
 #include <linux/kallsyms.h>
-/* #include <asm/sandbox-unwind.h> */
 #include "sandbox-unwind.h"
+#include "sandbox.h"
 #include <linux/sort.h>
 #include <asm/sections.h>
 #include <asm/unaligned.h>
@@ -9,10 +9,6 @@
 #include <linux/slab.h>
 #include <linux/sched.h>
 #include <linux/miscdevice.h>
-#include <linux/kprobes.h>
-
-#define SANDBOX_VERSION "0.1"
-#define OURMODNAME "sandbox-unwind"
 
 #define MAX_STACK_DEPTH 8
 
@@ -97,18 +93,10 @@ struct eh_frame_hdr_table_entry {
 	unsigned long start, fde;
 };
 
-typedef enum {
-	UNINIT = 0,
-	INIT
-} table_state;
+typedef enum { UNINIT = 0, INIT } table_state;
 
 struct unwind_item {
-	enum item_location {
-		Nowhere,
-		Memory,
-		Register,
-		Value
-	} where;
+	enum item_location { Nowhere, Memory, Register, Value } where;
 	uleb128_t value;
 };
 
@@ -121,8 +109,8 @@ struct unwind_state {
 		uleb128_t reg, offs;
 	} cfa;
 	struct unwind_item regs[ARRAY_SIZE(reg_info)];
-	unsigned stackDepth:8;
-	unsigned version:8;
+	unsigned stackDepth : 8;
+	unsigned version : 8;
 	const u8 *label;
 	const u8 *stack[MAX_STACK_DEPTH];
 };
@@ -146,18 +134,8 @@ static inline unsigned int extract32(unsigned int, int, int);
 static inline int sextract32(unsigned int, int, int);
 
 static const table_t *_find_table(const struct hash_table *, unsigned long);
-static const table_t *find_table(struct hash_table *, struct unwind_frame_info *);
-
-/* spinlock_t sandbox_unwind_lock; */
-
-static struct kprobe kp = {
-	.symbol_name = "kallsyms_lookup_name"
-};
-typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
-kallsyms_lookup_name_t __kallsyms_lookup_name;
-
-int (*traverse_vma)(unsigned long);
-int (*delta_app_inlist)(const char *);
+static const table_t *find_table(struct hash_table *,
+				 struct unwind_frame_info *);
 
 /** TODO: ztex
  * unwind_add_table() - Add the new unwind table to this list
@@ -185,7 +163,6 @@ err:
 	pr_err("[ztex] fail to add table given the path: %s\n", cur->name);
 	return NULL;
 }
-EXPORT_SYMBOL(unwind_add_table);
 
 /**
  * _find_table() - Find the right table given the pc.
@@ -195,7 +172,7 @@ EXPORT_SYMBOL(unwind_add_table);
  * but we need to find the right table given the pc
  */
 static const table_t *_find_table(const struct hash_table *phtable,
-			   const unsigned long pc)
+				  const unsigned long pc)
 {
 	int found = 0;
 	const table_t *ptable = phtable->root_table;
@@ -226,13 +203,10 @@ static const table_t *_find_table(const struct hash_table *phtable,
 }
 
 static const table_t *find_table(struct hash_table *phtable,
-			   struct unwind_frame_info *frame)
+				 struct unwind_frame_info *frame)
 {
 	int retval;
 	const table_t *table;
-
-	if (!traverse_vma)
-		traverse_vma = (void *)__kallsyms_lookup_name("traverse_vma");
 
 	table = _find_table(phtable, UNW_PC(frame));
 	if (!table) {
@@ -271,12 +245,12 @@ static uleb128_t get_uleb128(const u8 **pcur, const u8 *end)
 	unsigned int shift;
 
 	for (shift = 0, value = 0; cur < end; shift += 7) {
-		if (shift + 7 > 8 * sizeof(value)
-			&& (*cur & 0x7fU) >= (1U << (8 * sizeof(value) - shift))) {
+		if (shift + 7 > 8 * sizeof(value) &&
+		    (*cur & 0x7fU) >= (1U << (8 * sizeof(value) - shift))) {
 			cur = end + 1;
 			break;
 		}
-		value |= (uleb128_t) (*cur & 0x7f) << shift;
+		value |= (uleb128_t)(*cur & 0x7f) << shift;
 		if (!(*cur++ & 0x80))
 			break;
 	}
@@ -292,12 +266,12 @@ static sleb128_t get_sleb128(const u8 **pcur, const u8 *end)
 	unsigned int shift;
 
 	for (shift = 0, value = 0; cur < end; shift += 7) {
-		if (shift + 7 > 8 * sizeof(value)
-			&& (*cur & 0x7fU) >= (1U << (8 * sizeof(value) - shift))) {
+		if (shift + 7 > 8 * sizeof(value) &&
+		    (*cur & 0x7fU) >= (1U << (8 * sizeof(value) - shift))) {
 			cur = end + 1;
 			break;
 		}
-		value |= (sleb128_t) (*cur & 0x7f) << shift;
+		value |= (sleb128_t)(*cur & 0x7f) << shift;
 		if (!(*cur & 0x80)) {
 			value |= -(*cur++ & 0x40) << shift;
 			break;
@@ -314,12 +288,12 @@ static const u32 *__cie_for_fde(const u32 *fde)
 	CIE Pointer A 4 byte unsigned value that when subtracted from the offset of the current FDE
 	yields the offset of the start of the associated CIE. This value shall never be 0.
 	*/
-   const u32 *cie;
+	const u32 *cie;
 
-   // See: https://github.com/redox-os/binutils-gdb/blob/master/bfd/elf-eh-frame.c#900
-   cie = fde + 1 - fde[1] / sizeof(*fde);
+	// See: https://github.com/redox-os/binutils-gdb/blob/master/bfd/elf-eh-frame.c#900
+	cie = fde + 1 - fde[1] / sizeof(*fde);
 
-   return cie;
+	return cie;
 }
 
 static const u32 *cie_for_fde(const u32 *fde)
@@ -327,13 +301,15 @@ static const u32 *cie_for_fde(const u32 *fde)
 	const u32 *cie;
 
 	if (fde[0] == 0x0 || fde[0] == 0xffffffff) {
-		pr_debug("[ztex] the length field value is %x, stop processing\n", fde[0]);
+		pr_debug(
+			"[ztex] the length field value is %x, stop processing\n",
+			fde[0]);
 		return &bad_cie;
 	}
 
 	// Fixme ztex: here we make an assumption the we don't have extended length field
 	if (fde[1] == CIE_ID) {
-		return &not_fde;	/* this is a CIE */
+		return &not_fde; /* this is a CIE */
 	}
 
 	/*
@@ -341,8 +317,9 @@ static const u32 *cie_for_fde(const u32 *fde)
 	yields the offset of the start of the associated CIE. This value shall never be 0.
 	*/
 	if (fde[1] == 0x0) {
-		pr_err("[vicky] failed at [%s]: %d, CIE Pointer is 0\n", __FUNCTION__, __LINE__);
-		return NULL;	/* this is not a valid FDE */
+		pr_err("[vicky] failed at [%s]: %d, CIE Pointer is 0\n",
+		       __FUNCTION__, __LINE__);
+		return NULL; /* this is not a valid FDE */
 	}
 
 	cie = __cie_for_fde(fde);
@@ -386,7 +363,6 @@ static unsigned long read_pointer(const u8 **pLoc, const void *end,
 			value = get_unaligned((u16 *)ptr.p16u++);
 		break;
 	case DW_EH_PE_data4:
-/* #ifdef CONFIG_64BIT */
 		if (end < (const void *)(ptr.p32u + 1))
 			return 0;
 		if (ptrType & DW_EH_PE_signed)
@@ -396,9 +372,6 @@ static unsigned long read_pointer(const u8 **pLoc, const void *end,
 		break;
 	case DW_EH_PE_data8:
 		BUILD_BUG_ON(sizeof(u64) != sizeof(value));
-/* #else */
-/* 		BUILD_BUG_ON(sizeof(u32) != sizeof(value)); */
-/* #endif */
 		fallthrough;
 	case DW_EH_PE_native:
 		if (end < (const void *)(ptr.pul + 1))
@@ -474,9 +447,9 @@ static signed fde_pointer_type(const u32 *cie, unsigned long kern_base,
 			return -1;
 		}
 
-		++ptr;		/* skip terminator */
-		codeAlign = get_uleb128(&ptr, end);	/* skip code alignment */
-		dataAlign = get_sleb128(&ptr, end);	/* skip data alignment */
+		++ptr; /* skip terminator */
+		codeAlign = get_uleb128(&ptr, end); /* skip code alignment */
+		dataAlign = get_sleb128(&ptr, end); /* skip data alignment */
 		/* skip return address column */
 		version <= 1 ? (void)++ptr : (void)get_uleb128(&ptr, end);
 		len = get_uleb128(&ptr, end); /* augmentation length */
@@ -586,25 +559,33 @@ static inline int64_t sextract64(uint64_t value, int start, int length)
 	return ((int64_t)(value << (64 - length - start))) >> (64 - length);
 }
 
-void deinit_unwind_table(struct hash_table *phtable, int mode)
+void deinit_unwind_table(struct hash_table **phtable, int mode)
 {
-	table_t *tmp, *cur = phtable->root_table;
+	int i;
+	struct hash_table *phtab = *phtable;
+	table_t *tmp, *cur = phtab->root_table;
 
 	if (!cur)
 		return;
-
 	do {
 		tmp = cur;
+		pr_debug("[hsuck] current table=%s\n", tmp->info->name);
 		cur = cur->next;
 		if (mode == 1) {
 			RELEASE_MEMORY(tmp->header);
+			pr_debug("[hsuck] (%s, %d) cachesz=%u", tmp->info->name,
+				 phtab->pid, tmp->num_caches);
+			for (i = 0; i < tmp->num_caches; ++i)
+				RELEASE_MEMORY(tmp->state_cache[i]);
+			RELEASE_MEMORY(tmp->state_cache);
 		}
 		RELEASE_MEMORY(tmp);
-	} while (cur && cur != phtable->root_table);
+	} while (cur && cur != phtab->root_table);
+
+	(*phtable)->root_table = NULL;
 
 	return;
 }
-EXPORT_SYMBOL(deinit_unwind_table);
 
 static void _init_unwind_table(struct hash_table *phtable, struct so_info *cur,
 			       struct unwind_frame_info *frame)
@@ -625,7 +606,7 @@ static void _init_unwind_table(struct hash_table *phtable, struct so_info *cur,
 		unsigned long eh_frame_ptr;
 		unsigned int fde_count;
 		struct eh_frame_hdr_table_entry table[];
-	} __attribute__ ((__packed__)) *header;
+	} __attribute__((__packed__)) * header;
 
 	pr_debug("[hsuck] %s: kern_addr=%#0lx, size=%#0lx, user_addr=%#0lx\n",
 		 cur->name, table_start, tableSize, user_base);
@@ -633,12 +614,13 @@ static void _init_unwind_table(struct hash_table *phtable, struct so_info *cur,
 	if (table->info == NULL)
 		goto first;
 
-	if(!cur->name || !table->info->name) {
+	if (!cur->name || !table->info->name) {
 		pr_err("[vicky] current name or table info name is NULL.\n");
 		goto ret_err;
 	}
 
-	pr_debug("[hsuck] Initializing the table of %s, %d\n", cur->name, phtable->pid);
+	pr_debug("[hsuck] Initializing the table of %s, %d\n", cur->name,
+		 phtable->pid);
 
 	do {
 		pr_debug("[vicky] table name: %s, cur name:%s\n",
@@ -655,15 +637,16 @@ static void _init_unwind_table(struct hash_table *phtable, struct so_info *cur,
 		table = unwind_add_table(phtable, cur);
 	} else {
 		if (table->header && table->hdrsz) {
-			pr_debug("[hsuck] %s is inited, hdrsz=%#0lx\n", cur->name, table->hdrsz);
+			pr_debug("[hsuck] %s is inited, hdrsz=%#0lx\n",
+				 cur->name, table->hdrsz);
 			goto inited;
 		}
 	}
 	pr_debug("[hsuck] %s: %s\n", __FUNCTION__, table->info->name);
-	
+
 first:
 	table->info = cur;
-	table->address = (const void *) table_start;
+	table->address = (const void *)table_start;
 	table->size = tableSize;
 
 	for (fde = table->address, n = 0;
@@ -681,16 +664,18 @@ first:
 	// tableSize should be 4 now, cuz there will be a 4-bytes terminator here
 	pr_debug("[ztex] tableSize: %lu, n: %u\n", tableSize, n);
 	if (tableSize % 4 != 0 || !n) {
-		pr_err("[ztex] The table size or the number of fde is wrong. tableSize: %lu, n: %u\n", tableSize, n);
+		pr_err("[ztex] The table size or the number of fde is wrong. tableSize: %lu, n: %u\n",
+		       tableSize, n);
 		goto ret_err;
 	}
 
 	// FIXME ztex: this size is related to the size of `header` and the size of `struct eh_frame_hdr_table_entry`
-	hdrSize = 4 + sizeof(unsigned long) + sizeof(unsigned int)
-		+ n * sizeof(struct eh_frame_hdr_table_entry);
+	hdrSize = 4 + sizeof(unsigned long) + sizeof(unsigned int) +
+		  n * sizeof(struct eh_frame_hdr_table_entry);
 	header = kzalloc(hdrSize, GFP_KERNEL);
 	if (!header) {
-		pr_err("[ztex] fail to allocate header for size: %u\n", hdrSize);
+		pr_err("[ztex] fail to allocate header for size: %u\n",
+		       hdrSize);
 		goto ret_err;
 	}
 	state_cache = kzalloc(n * sizeof(struct unwind_state *), GFP_KERNEL);
@@ -715,11 +700,11 @@ first:
 
 	for (fde = table->address, tableSize = table->size, n = 0; tableSize;
 	     tableSize -= sizeof(*fde) + *fde, fde += 1 + *fde / sizeof(*fde)) {
-		signed ptrType; 
+		signed ptrType;
 		const u32 *cie = cie_for_fde(fde);
 
 		if (cie == &not_fde)
-			continue;	/* this is a CIE */
+			continue; /* this is a CIE */
 
 		if (cie == NULL || cie == &bad_cie)
 			break;
@@ -731,7 +716,8 @@ first:
 		ptrType = fde_pointer_type(cie, table_start, user_base);
 		if (ptrType == -1) {
 #if FIXME_SANDBOX > 0
-			pr_err("[hsuck] pointer type error, FDE: %#0lx\n", (unsigned long)fde);
+			pr_err("[hsuck] pointer type error, FDE: %#0lx\n",
+			       (unsigned long)fde);
 #endif // FIXME_SANDBOX
 		}
 		header->table[n].start =
@@ -748,7 +734,8 @@ first:
 	smp_wmb();
 	table->header = (const void *)header;
 	table->state_cache = (const void **)state_cache;
-	get_task_comm(table->name, frame->task);
+	table->num_caches = n;
+	/* get_task_comm(table->name, frame->task); */
 	pr_debug("[ztex] parsing .eh_frame sucessful\n");
 inited:
 	return;
@@ -764,7 +751,7 @@ void init_unwind_table(struct hash_table *phtable,
 
 	if (!phtable || hash_empty(phtable->htable)) {
 		pr_err("[hsuck] %s, L%d: hash table not found or no entries\n",
-			 __FUNCTION__, __LINE__);
+		       __FUNCTION__, __LINE__);
 		return;
 	}
 	pr_debug("[hsuck] %s, L%d: %s, inited=%d\n", __FUNCTION__, __LINE__,
@@ -779,7 +766,6 @@ void init_unwind_table(struct hash_table *phtable,
 	phtable->is_inited = 1;
 	return;
 }
-EXPORT_SYMBOL(init_unwind_table);
 
 static int advance_loc(unsigned long delta, struct unwind_state *state)
 {
@@ -793,7 +779,7 @@ static int advance_loc(unsigned long delta, struct unwind_state *state)
 }
 
 static void set_rule(uleb128_t reg, enum item_location where, uleb128_t value,
-			 struct unwind_state *state)
+		     struct unwind_state *state)
 {
 	if (reg < ARRAY_SIZE(state->regs)) {
 		state->regs[reg].where = where;
@@ -855,25 +841,27 @@ static int processCFI(const u8 *start, const u8 *end, unsigned long targetLoc,
 							  kern_base, user_base);
 				if (state->loc == 0)
 					result = 0;
-				pr_debug(KERN_CONT "DW_CFA_set_loc: 0x%lx ", state->loc);
+				pr_debug(KERN_CONT "DW_CFA_set_loc: 0x%lx ",
+					 state->loc);
 				break;
 			case DW_CFA_advance_loc1:
 				pr_debug(KERN_CONT "\nDW_CFA_advance_loc1: ");
-				result = ptr.p8 < end
-					&& advance_loc(*ptr.p8++, state);
+				result = ptr.p8 < end &&
+					 advance_loc(*ptr.p8++, state);
 				break;
 			case DW_CFA_advance_loc2:
 				pr_debug(KERN_CONT "\nDW_CFA_advance_loc2: ");
 				value = *ptr.p8++;
 				value += *ptr.p8++ << 8;
-				result = ptr.p8 <= end + 2
+				result =
+					ptr.p8 <= end + 2
 					/* && advance_loc(*ptr.p16++, state); */
 					&& advance_loc(value, state);
 				break;
 			case DW_CFA_advance_loc4:
 				pr_debug(KERN_CONT "\nDW_CFA_advance_loc4: ");
-				result = ptr.p8 <= end + 4
-					&& advance_loc(*ptr.p32++, state);
+				result = ptr.p8 <= end + 4 &&
+					 advance_loc(*ptr.p32++, state);
 				break;
 			case DW_CFA_offset_extended:
 				pr_debug(KERN_CONT "DW_CFA_offset_extended: ");
@@ -888,7 +876,8 @@ static int processCFI(const u8 *start, const u8 *end, unsigned long targetLoc,
 					 get_uleb128(&ptr.p8, end), state);
 				break;
 			case DW_CFA_offset_extended_sf:
-				pr_debug(KERN_CONT "DW_CFA_offset_extended_sf: ");
+				pr_debug(KERN_CONT
+					 "DW_CFA_offset_extended_sf: ");
 				value = get_uleb128(&ptr.p8, end);
 				set_rule(value, Memory,
 					 get_sleb128(&ptr.p8, end), state);
@@ -904,7 +893,8 @@ static int processCFI(const u8 *start, const u8 *end, unsigned long targetLoc,
 				break;
 			case DW_CFA_undefined:
 				value = get_uleb128(&ptr.p8, end);
-				pr_debug(KERN_CONT "DW_CFA_undefined: %lu", value);
+				pr_debug(KERN_CONT "DW_CFA_undefined: %lu",
+					 value);
 				break;
 			case DW_CFA_same_value:
 				pr_debug(KERN_CONT "DW_CFA_same_value: ");
@@ -914,8 +904,7 @@ static int processCFI(const u8 *start, const u8 *end, unsigned long targetLoc,
 			case DW_CFA_register:
 				pr_debug(KERN_CONT "DW_CFA_register: ");
 				value = get_uleb128(&ptr.p8, end);
-				set_rule(value,
-					 Register,
+				set_rule(value, Register,
 					 get_uleb128(&ptr.p8, end), state);
 				break;
 			case DW_CFA_remember_state:
@@ -935,11 +924,12 @@ static int processCFI(const u8 *start, const u8 *end, unsigned long targetLoc,
 					const u8 *label = state->label;
 
 					state->label =
-						state->stack[state->stackDepth - 1];
+						state->stack[state->stackDepth -
+							     1];
 					memcpy(&state->cfa, &badCFA,
-						   sizeof(state->cfa));
+					       sizeof(state->cfa));
 					memset(state->regs, 0,
-						   sizeof(state->regs));
+					       sizeof(state->regs));
 					state->stackDepth = 0;
 					result = processCFI(start, end, 0,
 							    ptrType, state,
@@ -952,19 +942,21 @@ static int processCFI(const u8 *start, const u8 *end, unsigned long targetLoc,
 				break;
 			case DW_CFA_def_cfa:
 				state->cfa.reg = get_uleb128(&ptr.p8, end);
-				pr_debug(KERN_CONT "DW_CFA_def_cfa: r%lu ", state->cfa.reg);
+				pr_debug(KERN_CONT "DW_CFA_def_cfa: r%lu ",
+					 state->cfa.reg);
 				fallthrough;
 			case DW_CFA_def_cfa_offset:
 				state->cfa.offs = get_uleb128(&ptr.p8, end);
-				pr_debug(KERN_CONT "DW_CFA_def_cfa_offset: %lu ",
-					  state->cfa.offs);
+				pr_debug(KERN_CONT
+					 "DW_CFA_def_cfa_offset: %lu ",
+					 state->cfa.offs);
 				break;
 			case DW_CFA_def_cfa_sf:
 				state->cfa.reg = get_uleb128(&ptr.p8, end);
 				fallthrough;
 			case DW_CFA_def_cfa_offset_sf:
-				state->cfa.offs = get_sleb128(&ptr.p8, end)
-					* state->dataAlign;
+				state->cfa.offs = get_sleb128(&ptr.p8, end) *
+						  state->dataAlign;
 				break;
 			case DW_CFA_def_cfa_register:
 				pr_debug(KERN_CONT "DW_CFA_def_cfa_register: ");
@@ -985,7 +977,8 @@ static int processCFI(const u8 *start, const u8 *end, unsigned long targetLoc,
 				break;
 			case DW_CFA_GNU_window_save:
 			default:
-				pr_debug(KERN_CONT "UNKNOWN OPCODE 0x%x\n", opcode);
+				pr_debug(KERN_CONT "UNKNOWN OPCODE 0x%x\n",
+					 opcode);
 				result = 0;
 				break;
 			}
@@ -1018,11 +1011,14 @@ static int processCFI(const u8 *start, const u8 *end, unsigned long targetLoc,
 		}
 	}
 
-	return result && ptr.p8 == end && (targetLoc == 0 || (
-		/*todo While in theory this should apply, gcc in practice omits
+	return result && ptr.p8 == end &&
+	       (targetLoc == 0 ||
+		(
+			/*todo While in theory this should apply, gcc in practice omits
 		  everything past the function prolog, and hence the location
 		  never reaches the end of the function.
-		targetLoc < state->loc && */  state->label == NULL));
+		targetLoc < state->loc && */
+			state->label == NULL));
 }
 
 int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
@@ -1038,7 +1034,7 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 	unsigned int i, fde_count;
 	signed ptrType = -1;
 	uleb128_t retAddrReg = 0;
-	const table_t  *table;
+	const table_t *table;
 	struct unwind_state *state;
 	unsigned long *fptr;
 	unsigned long temp = 0;
@@ -1052,7 +1048,7 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 
 	if (UNW_PC(frame) == 0) {
 		pr_err("[hsuck] %s, pc: %lx, sp: %lx\n", __FUNCTION__,
-			UNW_PC(frame), UNW_SP(frame));
+		       UNW_PC(frame), UNW_SP(frame));
 		return -EINVAL;
 	}
 
@@ -1076,7 +1072,7 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 		pr_err("[vicky] failed at [%s]: %d\n", __FUNCTION__, __LINE__);
 		return -EINVAL;
 	}
-	
+
 	smp_rmb();
 	switch (hdr[3] & DW_EH_PE_FORM) {
 	case DW_EH_PE_native:
@@ -1110,20 +1106,22 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 		return -EINVAL;
 	}
 	pr_debug("[hsuck] table name=%s, nFDE=%u\n", table->info->name,
-		fde_count);
+		 fde_count);
 
 	temp_ptr = (struct eh_frame_hdr_table_entry *)ptr;
 #if DEBUG_SANDBOX == 2
 	for (int i = 0; i < fde_count; i++) {
 		if (i % 100 == 0) {
-			pr_debug("[vicky] (user) %d: startLoc = %lx, fde = %lx\n",
-				 i,
-				 translate_kern_to_user(kern_base, user_base,
-						        temp_ptr[i].start),
-				 translate_kern_to_user(kern_base, user_base,
-						        temp_ptr[i].fde));
-			pr_debug("[vicky] (kern) %d: startLoc = %lx, fde = %lx\n",
-				 i, temp_ptr[i].start, temp_ptr[i].fde);
+			pr_debug(
+				"[vicky] (user) %d: startLoc = %lx, fde = %lx\n",
+				i,
+				translate_kern_to_user(kern_base, user_base,
+						       temp_ptr[i].start),
+				translate_kern_to_user(kern_base, user_base,
+						       temp_ptr[i].fde));
+			pr_debug(
+				"[vicky] (kern) %d: startLoc = %lx, fde = %lx\n",
+				i, temp_ptr[i].start, temp_ptr[i].fde);
 		}
 	}
 #endif //DEBUG_SANDBOX
@@ -1199,12 +1197,14 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 	else if (startLoc == translate_user_to_kern(kern_base, user_base,
 						    phtable->child_main))
 		return 3;
+	else if (startLoc == translate_user_to_kern(kern_base, user_base,
+						    phtable->start))
+		return 4;
 
 	if (cie != NULL) {
 		/* memset(&state, 0, sizeof(state)); */
-		if (table->state_cache == NULL)
-			pr_err("[hsuck] fuck\n");
-		if (!(const struct unwind_state *)table->state_cache[bs_r]) {
+		if (table->state_cache &&
+		    !(const struct unwind_state *)table->state_cache[bs_r]) {
 			state = kzalloc(sizeof(struct unwind_state),
 					GFP_KERNEL);
 			table->state_cache[bs_r] = (const void *)state;
@@ -1235,22 +1235,20 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 				}
 				break;
 			}
-			if (ptr >= end || *ptr){
+			if (ptr >= end || *ptr) {
 				pr_err("[vicky] failed at [%s]: %d, cie is NULL\n",
 				       __FUNCTION__, __LINE__);
 				cie = NULL;
 			}
 		}
 		++ptr;
-	}
-	else{
+	} else {
 		pr_err("[vicky] failed at [%s]: %d, cie is NULL\n",
 		       __FUNCTION__, __LINE__);
 	}
 
 	if (cached) {
-		get_uleb128(&ptr, end);
-		get_sleb128(&ptr, end);
+		ptr += 2;
 		retAddrReg = state->version <= 1 ? *ptr++ :
 						   get_uleb128(&ptr, end);
 		goto unwind;
@@ -1261,17 +1259,18 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 		state->codeAlign = get_uleb128(&ptr, end);
 		/* get data alignment factor */
 		state->dataAlign = get_sleb128(&ptr, end);
-		if (state->codeAlign == 0 || state->dataAlign == 0 || ptr >= end){
+		if (state->codeAlign == 0 || state->dataAlign == 0 ||
+		    ptr >= end) {
 			pr_err("[vicky] failed at [%s]: %d, cie is NULL\n",
 			       __FUNCTION__, __LINE__);
 			cie = NULL;
-		}
-		else {
+		} else {
 			retAddrReg = state->version <= 1 ?
 					     *ptr++ :
 					     get_uleb128(&ptr, end);
 			pr_debug("[hsuck] CIE Frame Info:\n");
-			pr_debug("[hsuck] return Address register 0x%lx\n", retAddrReg);
+			pr_debug("[hsuck] return Address register 0x%lx\n",
+				 retAddrReg);
 			pr_debug("[hsuck] data Align: %ld\n", state->dataAlign);
 			pr_debug("[hsuck] code Align: %lu\n", state->codeAlign);
 			/* skip augmentation */
@@ -1342,7 +1341,8 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 
 unwind:
 #if DEBUG_SANDBOX == 1
-	pr_debug("[hsuck] Register state based on the rules parsed from FDE:\n");
+	pr_debug(
+		"[hsuck] Register state based on the rules parsed from FDE:\n");
 	for (i = 0; i < ARRAY_SIZE(state->regs); ++i) {
 		if (REG_INVALID(i))
 			continue;
@@ -1352,7 +1352,7 @@ unwind:
 			break;
 		case Memory:
 			pr_debug(" x%d: c(%ld),", i,
-				state->regs[i].value * state->dataAlign);
+				 state->regs[i].value * state->dataAlign);
 			break;
 		case Register:
 			pr_debug(" x%d: r(%ld),", i, state->regs[i].value);
@@ -1398,9 +1398,9 @@ unwind:
 			break;
 		case Register:
 			if (state->regs[i].value >= ARRAY_SIZE(reg_info) ||
-			    	REG_INVALID(state->regs[i].value) ||
-			    	reg_info[i].width >
-					reg_info[state->regs[i].value].width) {
+			    REG_INVALID(state->regs[i].value) ||
+			    reg_info[i].width >
+				    reg_info[state->regs[i].value].width) {
 				pr_err("[vicky] failed at [%s]: %d\n",
 				       __FUNCTION__, __LINE__);
 				/* RELEASE_MEMORY(state); */
@@ -1420,12 +1420,10 @@ unwind:
 				state->regs[i].value = FRAME_REG(
 					state->regs[i].value, const u32);
 				break;
-/* #ifdef CONFIG_64BIT */
 			case sizeof(u64):
 				state->regs[i].value = FRAME_REG(
 					state->regs[i].value, const u64);
 				break;
-/* #endif */
 			default:
 				pr_err("[vicky] failed at [%s]: %d\n",
 				       __FUNCTION__, __LINE__);
@@ -1436,7 +1434,8 @@ unwind:
 		}
 	}
 
-	pr_debug("[hsuck] Register state after evaluation with realtime Stack:\n");
+	pr_debug(
+		"[hsuck] Register state after evaluation with realtime Stack:\n");
 	fptr = (unsigned long *)(&frame->regs);
 	for (i = 0; i < ARRAY_SIZE(state->regs); ++i, fptr++) {
 		if (REG_INVALID(i))
@@ -1517,7 +1516,6 @@ unwind:
 			default:
 				pr_err("[vicky] failed at [%s]: %d\n",
 				       __FUNCTION__, __LINE__);
-				/* RELEASE_MEMORY(state); */
 				return -EIO;
 			}
 			break;
@@ -1563,8 +1561,10 @@ static unsigned long disas_b_insns(const struct unwind_frame_info *frame,
 	unsigned long retval;
 
 	switch (extract32(insn, 25, 7)) {
-	case 0x0a: case 0x0b:
-	case 0x4a: case 0x4b:
+	case 0x0a:
+	case 0x0b:
+	case 0x4a:
+	case 0x4b:
 		retval = disas_uncond_b_imm(addr, insn);
 		if (insn & (1U << 31))
 			pr_debug("[hsuck] bl insn\n");
@@ -1633,7 +1633,8 @@ static unsigned long disas_data_proc_imm(unsigned long addr, unsigned int insn)
 	unsigned long retval;
 
 	switch (extract32(insn, 23, 6)) {
-	case 0x20: case 0x21:
+	case 0x20:
+	case 0x21:
 		retval = disas_pc_rel_adr(addr, insn);
 		break;
 	default:
@@ -1666,8 +1667,10 @@ static unsigned long disas_ldst(unsigned long addr, unsigned int insn)
 {
 	unsigned long retval;
 	switch (extract32(insn, 24, 6)) {
-	case 0x38: case 0x39:
-	case 0x3c: case 0x3d:
+	case 0x38:
+	case 0x39:
+	case 0x3c:
+	case 0x3d:
 		retval = disas_ldst_reg(addr, insn);
 		break;
 	default:
@@ -1728,8 +1731,7 @@ out:
  */
 static int find_all_branches(struct hash_table *phtable,
 			     struct unwind_frame_info *frame,
-			     unsigned long entry_point,
-			     unsigned short depth)
+			     unsigned long entry_point, unsigned short depth)
 {
 	const u32 *fde = NULL, *cie = NULL;
 	const u8 *ptr = NULL, *end = NULL, *hdr = NULL;
@@ -1773,7 +1775,7 @@ static int find_all_branches(struct hash_table *phtable,
 		pr_err("[vicky] failed at [%s]: %d\n", __FUNCTION__, __LINE__);
 		return -EINVAL;
 	}
-	
+
 	smp_rmb();
 	switch (hdr[3] & DW_EH_PE_FORM) {
 	case DW_EH_PE_native:
@@ -1893,8 +1895,10 @@ static int find_all_branches(struct hash_table *phtable,
 		/* Branch insns */
 		if (insn_type == 0xa || insn_type == 0xb) {
 			switch (extract32(insn, 25, 7)) {
-			case 0x0a: case 0x0b:
-			case 0x4a: case 0x4b:
+			case 0x0a:
+			case 0x0b:
+			case 0x4a:
+			case 0x4b:
 				/* BL Branch with link */
 				if (insn & (1U << 31)) {
 					pr_debug("[hsuck] bl insn\n");
@@ -1923,13 +1927,14 @@ static int find_all_branches(struct hash_table *phtable,
 
 			b_target = disas_b_insns(frame, addr, insn);
 			pr_debug("[hsuck] addr=%#0lx, branch target=%#0lx\n",
-				addr, b_target);
+				 addr, b_target);
 			/* In same function */
 			if (b_target >= startLoc && b_target < endLoc)
 				goto loop_end;
 
 			if (b_target >= start_plt && b_target < end_plt) {
-				pr_debug("[hsuck] the plt of %s [%#0lx-%#0lx]\n",
+				pr_debug(
+					"[hsuck] the plt of %s [%#0lx-%#0lx]\n",
 					table->info->name, start_plt, end_plt);
 				pr_debug("[hsuck] addr=%#0lx, insn=%#0x,"
 					 " type=%#0x, branch target=%#0lx\n",
@@ -2006,8 +2011,9 @@ static int callsite_checking(struct hash_table *phtable,
 	/* Compare call target with function entry point */
 	if (bl_target == entry_point) {
 		if (!is_stp(bl_target))
-			pr_debug("[ztex] %d: %#0lx is a function allocating no space\n",
-				 __LINE__, bl_target);
+			pr_debug(
+				"[ztex] %d: %#0lx is a function allocating no space\n",
+				__LINE__, bl_target);
 		goto out_print_suc;
 	} else {
 		table = find_table(phtable, frame);
@@ -2019,8 +2025,9 @@ static int callsite_checking(struct hash_table *phtable,
 		}
 
 		if (!table->info->plt_found) {
-			pr_debug("[ztex] %s: we did not find .plt section previously\n", 
-				 table->info->name);
+			pr_debug(
+				"[ztex] %s: we did not find .plt section previously\n",
+				table->info->name);
 			retval = -1;
 			addr = bl_target;
 			goto find_b;
@@ -2030,8 +2037,9 @@ static int callsite_checking(struct hash_table *phtable,
 		start = table->info->base_address + table->info->plt_start;
 		end = start + table->info->plt_size;
 		if (addr < start || addr >= end) {
-			pr_debug("[hsuck] call target %#0lx is not a plt entry\n",
-				 addr);
+			pr_debug(
+				"[hsuck] call target %#0lx is not a plt entry\n",
+				addr);
 			retval = -1;
 			goto find_b;
 		}
@@ -2051,7 +2059,8 @@ find_b:
 			goto out_print_suc;
 		else if (retval == 1) {
 			pr_debug("[hsuck] fucking br...\n");
-			pr_debug("[hsuck] %d: addr=%#0lx, target=%#0lx, entry=%#0lx\n",
+			pr_debug(
+				"[hsuck] %d: addr=%#0lx, target=%#0lx, entry=%#0lx\n",
 				__LINE__, UNW_PC(frame) - 4, bl_target,
 				entry_point);
 			goto out_print_suc;
@@ -2081,10 +2090,6 @@ int delta_enforce_verification(struct hash_table *phtable,
 	int i = 0;
 	unsigned long prev_pc = 0;
 
-	if (!delta_app_inlist)
-		delta_app_inlist = (void *)__kallsyms_lookup_name("delta_app_inlist");	
-
-	/* Unwinding until reach main() */
 	while (true) {
 		prev_pc = UNW_PC(frame);
 		retval = delta_unwind(phtable, frame);
@@ -2097,23 +2102,36 @@ int delta_enforce_verification(struct hash_table *phtable,
 
 		/* Reached the entry point of the program */
 		if (retval == 1) {
-			pr_debug("[hsuck] unwinding sucessfully reached main: %#0lx\n",
+			pr_debug("[hsuck] unwinding sucessfully reached "
+				 "main: %#0lx\n",
 				 frame->entry_point);
 			break;
 		} else if (retval == 2 &&
 			   delta_app_inlist(current->parent->comm)) {
-			pr_debug("[hsuck] unwinding sucessfully reached __clone: %#0lx\n",
+			pr_debug("[hsuck] unwinding sucessfully reached "
+				 "__clone: %#0lx\n",
 				 frame->entry_point);
 			break;
 		} else if (retval == 3 &&
 			   delta_app_inlist(current->parent->comm)) {
-			pr_debug("[hsuck] unwinding sucessfully reached child_main: %#0lx\n",
+			pr_debug("[hsuck] unwinding sucessfully reached "
+				 "child_main: %#0lx\n",
 				 frame->entry_point);
 			break;
-		} else if (UNW_PC(frame) == prev_pc) {
+		} /* else if (UNW_PC(frame) == prev_pc) {
 			pr_err("[hsuck] %s, L%d: pc: %lx, sp: %lx\n",
 			       __FUNCTION__, __LINE__, UNW_PC(frame),
 			       UNW_SP(frame));
+			break;
+			}*/
+		else if (retval == 4) {
+			pr_debug("[hsuck] unwinding sucessfully reached "
+				 "_start: %#0lx\n",
+				 frame->entry_point);
+			break;
+		} else if (i == 100) {
+			pr_err("[hsuck] %s, L%d: pc=%#0lx\n", __FUNCTION__,
+			       __LINE__, UNW_PC(frame));
 			break;
 		}
 
@@ -2121,73 +2139,5 @@ int delta_enforce_verification(struct hash_table *phtable,
 		i++;
 	}
 	pr_debug("[hsuck] the length of entire call stack=%d\n", i);
-	/* if (i == 60) { */
-	/* 	pr_err("[hsuck] %s, pid: %d, pc: %lx, sp: %lx\n", __FUNCTION__, */
-	/* 	       current->pid, UNW_PC(frame), UNW_SP(frame)); */
-	/* } */
 	return retval;
 }
-EXPORT_SYMBOL(delta_enforce_verification);
-
-static int rootkit_open(struct inode *inode, struct file *filp)
-{
-	pr_info("[hsuck] %s\n", __FUNCTION__);
-	return 0;
-}
-
-static int rootkit_release(struct inode *inode, struct file *filp)
-{
-	pr_info("[hsuck] %s\n", __FUNCTION__);
-	return 0;
-}
-
-static long rootkit_ioctl(struct file *filp, unsigned int ioctl,
-			  unsigned long arg)
-{
-	pr_info("[hsuck] %s\n", __FUNCTION__);
-	return 0;
-}
-struct file_operations fops = {
-	open: rootkit_open,
-	unlocked_ioctl: rootkit_ioctl,
-	release: rootkit_release,
-	owner: THIS_MODULE
-};
-
-static struct miscdevice sandbox_unwind = {
-	.minor = MISC_DYNAMIC_MINOR,
-	.name = "sandbox_unwind",
-	.fops = &fops,
-	.mode = 0664,
-};
-
-static int __init sandbox_unwind_init(void) { 
-	int ret;
-
-	if ((ret = misc_register(&sandbox_unwind)) < 0)
-		pr_err("[hsuck] misc_register failed, ret = %d\n", ret);
-
-	pr_info("[vicky] successfully init %s\n", OURMODNAME);
-
-	register_kprobe(&kp);
-	__kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
-	unregister_kprobe(&kp);
-
-	traverse_vma = NULL;
-	delta_app_inlist = NULL;
-
-	return 0; 
-}
-static void __exit sandbox_unwind_exit(void) { 
-	pr_info("[vicky] %s: removed\n", OURMODNAME);
-	misc_deregister(&sandbox_unwind);
-	return;
-}
-
-module_init(sandbox_unwind_init);
-module_exit(sandbox_unwind_exit);
-
-MODULE_AUTHOR("hsuck <r11944008@csie.ntu.edu.tw>");
-MODULE_DESCRIPTION("Delta sandbox system call protection");
-MODULE_LICENSE("GPL");
-MODULE_VERSION(SANDBOX_VERSION);

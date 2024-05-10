@@ -13,6 +13,8 @@
 #include <linux/mm.h>
 #include <linux/string.h>
 #include <linux/types.h>
+#include <linux/time.h>
+#include <linux/timekeeping.h>
 #include <linux/elf.h>
 #include <linux/kprobes.h>
 #include <asm/syscall.h>
@@ -35,7 +37,10 @@
 #define CLONE_ENTRY 0xea5d0
 #define CHILD_MAIN  0x83ffc
 
-char *hook_apps[] = {"httpd", "nginx", "sqlite-bench"};
+unsigned int num_apps = 10;
+char *hook_apps[] = { "httpd",	  "nginx",     "sqlite-bench", "omnetpp",
+		      "cpuxalan", "deepsjeng", "leela",	       "namd",
+		      "povray",	  "test2" };
 
 typedef unsigned long (*kallsyms_lookup_name_t)(const char *name);
 kallsyms_lookup_name_t __kallsyms_lookup_name;
@@ -61,11 +66,24 @@ static sys_call_t orig_socket, orig_bind, orig_connect, orig_listen,
 	orig_accept, orig_accept4;
 static sys_call_t orig_exit, orig_exit_group;
 
-extern table_t *unwind_add_table(struct hash_table *, const struct so_info *);
-extern void init_unwind_table(struct hash_table *, struct unwind_frame_info *);
-extern void deinit_unwind_table(struct hash_table *, int);
-extern int delta_enforce_verification(struct hash_table *,
-				      struct unwind_frame_info *);
+static struct hash_table *search_htable(const char *, const pid_t);
+static int create_htable(const char *, const pid_t, bool);
+
+static struct so_info *search_item(struct hash_table *, const char *);
+static int insert_item(struct hash_table *, const char *);
+
+static int elf_read(struct file *file, void *buf, size_t len, loff_t pos);
+static struct elf_shdr *load_elf_shdrs(const struct elfhdr *elf_ex,
+				       struct file *elf_file);
+static struct elf_shdr *elf_find_strtab(const struct elfhdr *elf_ex,
+					struct elf_shdr *elf_shdata);
+static char *elf_fetch_tab(struct file *elf_file, struct elf_shdr *elf_shtab);
+static void elf_get_so(struct elf_shdr *elf_shdynamic, char *dynamic,
+		       char *strtab, struct hash_table *phtable);
+static char *_lib_fetch_ehframe(struct file *file, struct so_info *cur,
+				struct hash_table *phtable);
+static void lib_fetch_ehframe(const char *libname, struct file *libfile,
+			      struct hash_table *phtable);
 
 DECLARE_HASHTABLE(proc_htable, 16);
 
@@ -75,21 +93,43 @@ static struct kprobe kp = { .symbol_name = "kallsyms_lookup_name" };
 inline int delta_app_inlist(const char *task_comm)
 {
 	int i;
-	for (i = 0; i < 3; ++i) {
-		if (!strcmp(task_comm, hook_apps[i]))
+	for (i = 0; i < num_apps; ++i) {
+		if (strstr(task_comm, hook_apps[i]))
 			return 1;
 	}
 	return 0;
 }
-EXPORT_SYMBOL(delta_app_inlist);
+
+char *get_task_full_comm(const struct task_struct *t)
+{
+	char *filepath = NULL, *p;
+	struct mm_struct *mm;
+
+	mm = get_task_mm(current);
+	if (mm) {
+		down_read(&mm->mmap_lock);
+		if (mm->exe_file) {
+			filepath = kzalloc(PATH_MAX, GFP_KERNEL);
+			if (!filepath)
+				goto out;
+			p = file_path(mm->exe_file, filepath, PATH_MAX);
+		}
+		up_read(&mm->mmap_lock);
+	}
+
+	RELEASE_MEMORY(filepath);
+out:
+	return p;
+}
 
 #if DEBUG_SANDBOX > 0
 static void hexdump(char *buffer, unsigned long size)
 {
 	while (size >= 8) {
-		pr_debug("[ztex] %px: %02x %02x %02x %02x %02x %02x %02x %02x\n",
-			 buffer, buffer[0], buffer[1], buffer[2], buffer[3],
-			 buffer[4], buffer[5], buffer[6], buffer[7]);
+		pr_debug(
+			"[ztex] %px: %02x %02x %02x %02x %02x %02x %02x %02x\n",
+			buffer, buffer[0], buffer[1], buffer[2], buffer[3],
+			buffer[4], buffer[5], buffer[6], buffer[7]);
 		buffer += 8;
 		size -= 8;
 	}
@@ -99,33 +139,49 @@ static void hexdump(char *buffer, unsigned long size)
 static int open_by_self(unsigned long pc)
 {
 	/* FIXME hsuck: may need more aliases*/
+	int retval;
 	char *ldname = "ld-linux-aarch64.so.1";
 	char *rtlib = "librtlib.so";
+	char *filepath;
 	struct so_info *cur;
-	struct hash_table *phtable = search_htable(current->comm, current->pid);
+	struct hash_table *phtable;
 
-	if (!phtable || hash_empty(phtable->htable))
-		return -1;
+	filepath = get_task_full_comm(current);
+	phtable = search_htable(kbasename(filepath), task_pid_nr(current));
+	if (!phtable || hash_empty(phtable->htable)) {
+		retval = -1;
+		goto out;
+	}
 
 	cur = search_item(phtable, ldname);
 	/* FIXME hsuck: may static link or not found */
-	if (!cur)
-		return 1;
+	if (!cur) {
+		retval = 1;
+		goto out;
+	}
 
 	pr_debug("[hsuck] %s, L%d: pc=%#0lx, range=[%#0lx-%#0lx]\n",
 		 __FUNCTION__, __LINE__, pc, cur->base_address,
 		 cur->base_address + cur->pc_range);
-	if (pc >= cur->base_address && pc < cur->base_address + cur->pc_range)
-		return 0;
+	if (pc >= cur->base_address && pc < cur->base_address + cur->pc_range) {
+		retval = 0;
+		goto out;
+	}
 
 	cur = search_item(phtable, rtlib);
-	if (!cur)
-		return 1;
+	if (!cur) {
+		retval = 1;
+		goto out;
+	}
 
-	if (pc >= cur->base_address && pc < cur->base_address + cur->pc_range) 
-		return 0;
+	if (pc >= cur->base_address && pc < cur->base_address + cur->pc_range) {
+		retval = 0;
+		goto out;
+	}
 
-	return 1;
+out:
+	
+	return retval;
 }
 
 static void unwind_stack(void)
@@ -136,26 +192,38 @@ static void unwind_stack(void)
 	struct hash_table *phtable;
 	unsigned long addr, size;
 	int retval;
-	char *ehframe;
+	char *ehframe, *filepath;
 
-	phtable = search_htable(current->comm, current->pid);
+#if MEASURE_TIME == 1
+	struct timespec64 begin, end, ts;
+	ktime_get_ts64(&begin);
+#endif
+	filepath = get_task_full_comm(current);
+	phtable = search_htable(kbasename(filepath), task_pid_nr(current));
+#if MEASURE_TIME == 1
+	ktime_get_ts64(&end);
+	ts = timespec64_sub(end, begin);
+	pr_info("[hsuck] time spent for search_htable, %lld (ns) elapsed\n",
+		timespec64_to_ns(&ts));
+#endif
 	if (!phtable) {
 		pr_err("[hsuck] %s, L%d: %s, %d, htable not found\n",
-		       __FUNCTION__, __LINE__, current->comm, current->pid);
+		       __FUNCTION__, __LINE__, kbasename(filepath),
+		       task_pid_nr(current));
 		goto out;
 	}
 
-	proc_info = search_item(phtable, current->comm);
+	proc_info = search_item(phtable, kbasename(filepath));
 	if (!proc_info) {
 		pr_err("[hsuck] %s, L%d: %s, item not found\n", __FUNCTION__,
-		       __LINE__, current->comm);
+		       __LINE__, kbasename(filepath));
 		goto out;
 	}
 
 	if (proc_info->ehframe)
 		goto unwind_table;
 
-	pr_debug("[hsuck] fetching .eh_frame of %s\n", current->comm);
+	pr_debug("[hsuck] fetching .eh_frame of %s\n", kbasename(filepath));
 	if (proc_info->eh_frame_found != 1) {
 		pr_err("[ztex] we did not find .eh_frame section previously\n");
 		goto out;
@@ -165,13 +233,12 @@ static void unwind_stack(void)
 	size = proc_info->eh_frame_size;
 	pr_debug("[hsuck] .eh_frame: size=%lu, addr=%#0lx\n", size, addr);
 
-	ehframe = kmalloc(size, GFP_KERNEL);
+	ehframe = kzalloc(size, GFP_KERNEL);
 	if (!ehframe) {
-		pr_err("[hsuck] %s, L%d: buffer allocation failed\n", __FUNCTION__,
-		       __LINE__);
+		pr_err("[hsuck] %s, L%d: buffer allocation failed\n",
+		       __FUNCTION__, __LINE__);
 		goto out;
 	}
-	memset(ehframe, 0, size);
 
 	if (copy_from_user(ehframe, (void __user *)addr, size)) {
 		pr_err("[hsuck] %s, L%d: failed to read from user space, "
@@ -187,8 +254,8 @@ unwind_table:
 
 	phtable->root_table = kmalloc(sizeof(table_t), GFP_KERNEL);
 	if (!phtable->root_table) {
-		pr_err("[hsuck] %s, L%d buffer allocation failed\n", __FUNCTION__,
-		       __LINE__);
+		pr_err("[hsuck] %s, L%d buffer allocation failed\n",
+		       __FUNCTION__, __LINE__);
 		goto out;
 	}
 	phtable->root_table->address = 0x0;
@@ -203,8 +270,8 @@ unwinding:
 	regs = task_pt_regs(current);
 	frame = kmalloc(sizeof(struct unwind_frame_info), GFP_KERNEL);
 	if (!frame) {
-		pr_err("[hsuck] %s, L%d: buffer allocation failed\n", __FUNCTION__,
-		       __LINE__);
+		pr_err("[hsuck] %s, L%d: buffer allocation failed\n",
+		       __FUNCTION__, __LINE__);
 		return;
 	}
 	memcpy(&frame->regs, regs->regs, sizeof(unsigned long) * 31);
@@ -213,15 +280,37 @@ unwinding:
 	frame->regs.pstate = regs->pstate;
 	frame->task        = current;
 
-	init_unwind_table(phtable, frame);
+#if MEASURE_TIME == 1
+	ktime_get_ts64(&begin);
+#endif
+	if (!phtable->is_inited)
+		init_unwind_table(phtable, frame);
+#if MEASURE_TIME == 1
+	ktime_get_ts64(&end);
+	ts = timespec64_sub(end, begin);
+	pr_info("[hsuck] time spent for init_unwind_table, %lld (ns) elapsed\n",
+		timespec64_to_ns(&ts));
+#endif
+
+#if MEASURE_TIME == 1
+	ktime_get_ts64(&begin);
+#endif
 	retval = delta_enforce_verification(phtable, frame);
+#if MEASURE_TIME == 1
+	ktime_get_ts64(&end);
+	ts = timespec64_sub(end, begin);
+	pr_info("[hsuck] time spent for delta_enforce_verification, %lld (ns) elapsed\n",
+		timespec64_to_ns(&ts));
+#endif
+
 	/* if (retval == -1) { */
-	/* 	pr_debug("[hsuck] kill the process %d\n", current->pid); */
-	/* 	do_exit(-1); */
+	/*	pr_debug("[hsuck] kill the process %d\n", task_pid_nr(current)); */
+	/*	do_exit(-1); */
 	/* } */
 
 	RELEASE_MEMORY(frame);
 out:
+	
 	return;
 out_free_ehf:
 	RELEASE_MEMORY(ehframe);
@@ -231,11 +320,18 @@ out_free_ehf:
 static void fill_base(const char *libname, unsigned long base_address,
 		      unsigned long size)
 {
+	char *filepath = NULL;
 	struct so_info *cur;
-	struct hash_table *phtable = search_htable(current->comm, current->pid);
+	struct hash_table *phtable;
 
-	if (!phtable || !libname || !base_address || !size)
+	filepath = get_task_full_comm(current);
+	phtable = search_htable(kbasename(filepath), task_pid_nr(current));
+	if (!phtable || !libname || !base_address || !size) {
+		pr_debug("[hsuck] %s, L%d: %s(%d) %s %ld %ld\n", __FUNCTION__,
+			 __LINE__, kbasename(filepath), task_pid_nr(current),
+			 libname, base_address, size);
 		return;
+	}
 
 	cur = search_item(phtable, libname);
 	if (!cur) {
@@ -261,19 +357,28 @@ out:
 	    cur->base_address > phtable->elf_entry)
 		phtable->elf_entry += cur->base_address;
 
+	if (strcmp(phtable->name, cur->name) == 0 &&
+	    cur->base_address > phtable->start)
+		phtable->start += cur->base_address;
+
 	pr_debug("[hsuck] %s, elf entry: %#0lx\n", phtable->name,
 		 phtable->elf_entry);
 
+	pr_debug("[hsuck] %s, _start: %#0lx\n", phtable->name,
+		 phtable->start);
+
 	pr_debug("[hsuck] %s: dump info of %s\n", __FUNCTION__, cur->name);
-	pr_debug("[hsuck] base addr: %#0lx, size: %#0lx, offset: %#0lx, pc range: %#0lx\n",
-		 cur->base_address, cur->eh_frame_size, cur->eh_frame_start,
-		 cur->pc_range);
+	pr_debug(
+		"[hsuck] base addr: %#0lx, size: %#0lx, offset: %#0lx, pc range: %#0lx\n",
+		cur->base_address, cur->eh_frame_size, cur->eh_frame_start,
+		cur->pc_range);
+
 	return;
 }
 
 int traverse_vma(unsigned long pc)
 {
-	char *p, prev_p[256];
+	char *p, prev_p[256], *filepath;
 	unsigned long addr = 0, size = 0;
 	short first = 1;
 	struct mm_struct *mm;
@@ -293,6 +398,7 @@ redo:
 	/* ref: https://lore.kernel.org/all/20220426150616.3937571-69-Liam.Howlett@oracle.com/ */
 	for (vma = __find_vma_prev(mm, mm->start_code, &prev); vma;
 	     vma = __find_vma_prev(mm, vma->vm_end, &prev)) {
+		
 		if (vma->vm_file) {
 			char *buf = kmalloc(PATH_MAX + 11, GFP_KERNEL);
 			if (buf) {
@@ -314,14 +420,18 @@ redo:
 			/* new shared object */
 			if ((vma->vm_flags & VM_EXEC) && pc >= vma->vm_start &&
 			    pc < vma->vm_end) {
-				pr_debug("[hsuck] find corresponding pc=%#0lx\n",
-					 pc);
-				phtable = search_htable(current->comm,
-							current->pid);
+				pr_debug(
+					"[hsuck] find corresponding pc=%#0lx\n",
+					pc);
+				filepath = get_task_full_comm(current);
+				phtable = search_htable(kbasename(filepath),
+							task_pid_nr(current));
 				if (!phtable) {
 					pr_err("[hsuck] %s, L%d: %s, %d, htable not found\n",
 					       __FUNCTION__, __LINE__,
-					       current->comm, current->pid);
+					       kbasename(filepath),
+					       task_pid_nr(current));
+					
 					return -EFAULT;
 				}
 				lib_fetch_ehframe(NULL, vma->vm_file, phtable);
@@ -363,31 +473,41 @@ loop_out:
 
 	return 0;
 }
-EXPORT_SYMBOL(traverse_vma);
 
 static int is_all_filled(void)
 {
-	int bkt;
+	char *filepath;
+	int bkt, retval;
 	struct hash_table *phtable = NULL;
 	struct so_info *cur;
 
-	phtable = search_htable(current->comm, current->pid);
-	if (!phtable || hash_empty(phtable->htable))
-		return -1;
+	filepath = get_task_full_comm(current);
+	phtable = search_htable(kbasename(filepath), task_pid_nr(current));
+	if (!phtable || hash_empty(phtable->htable)) {
+		retval = -1;
+		goto out;
+	}
 
-	if (phtable->is_filled == 1)
-		return 1;
+	if (phtable->is_filled == 1) {
+		retval = 1;
+		goto out;
+	}
 
 	/* linear search */
 	hash_for_each (phtable->htable, bkt, cur, node) {
 		pr_debug("[hsuck] %s[%#0lx-%#0lx]\n", cur->name,
 			 cur->base_address, cur->base_address + cur->pc_range);
-		if (!cur->base_address || !cur->pc_range)
-			return 0;
+		if (!cur->base_address || !cur->pc_range) {
+			retval = 0;
+			goto out;
+		}
 	}
 
 	phtable->is_filled = 1;
-	return phtable->is_filled;
+	retval = 1;
+out:
+	
+	return retval;
 }
 
 /* FIXME hsuck: may need to replace with SHA256 or other hash function? */
@@ -407,11 +527,12 @@ inline static u32 myhash(const char *s)
  * @pname: the name of process
  * Return NULL upon failure.
  */
-struct hash_table *search_htable(const char *pname, const pid_t pid)
+static struct hash_table *search_htable(const char *pname, const pid_t pid)
 {
 	struct hash_table *phtable;
 	u32 key = myhash(pname);
 
+	pr_debug("[hsuck] %s: %s(%d), key=%d\n", __FUNCTION__, pname, pid, key);
 	key += pid;
 	hash_for_each_possible (proc_htable, phtable, node, key)
 		if (strcmp(phtable->name, pname) == 0 && pid == phtable->pid)
@@ -425,12 +546,13 @@ struct hash_table *search_htable(const char *pname, const pid_t pid)
  * @pid     : the pid of the process
  * @set_cntr: if true, create a counter for this process
  */
-int create_htable(const char *pname, const pid_t pid, bool set_cntr)
+static int create_htable(const char *pname, const pid_t pid, bool set_cntr)
 {
 	int retval = -1;
 	struct hash_table *phtable;
 	u32 key = myhash(pname);
 
+	pr_debug("[hsuck] %s: %s(%d), key=%d\n", __FUNCTION__, pname, pid, key);
 	key += pid;
 	if (search_htable(pname, pid)) {
 		pr_err("[hsuck] %s, L%d %s, %d htable has already existed\n",
@@ -440,8 +562,8 @@ int create_htable(const char *pname, const pid_t pid, bool set_cntr)
 
 	phtable = kmalloc(sizeof(struct hash_table), GFP_KERNEL);
 	if (!phtable) {
-		pr_err("[hsuck] %s, L%d: buffer allocation failed\n", __FUNCTION__,
-		       __LINE__);
+		pr_err("[hsuck] %s, L%d: buffer allocation failed\n",
+		       __FUNCTION__, __LINE__);
 		goto out;
 	}
 	memset(phtable, 0, sizeof(struct hash_table));
@@ -449,8 +571,8 @@ int create_htable(const char *pname, const pid_t pid, bool set_cntr)
 
 	phtable->name = kmalloc(strlen(pname) + 1, GFP_KERNEL);
 	if (!phtable->name) {
-		pr_err("[hsuck] %s, L%d: buffer allocation failed\n", __FUNCTION__,
-		       __LINE__);
+		pr_err("[hsuck] %s, L%d: buffer allocation failed\n",
+		       __FUNCTION__, __LINE__);
 		goto out_free_phtable;
 	}
 	memset(phtable->name, 0, strlen(pname) + 1);
@@ -473,7 +595,7 @@ int create_htable(const char *pname, const pid_t pid, bool set_cntr)
 out:
 	return retval;
 
-/* error cleanup*/
+	/* error cleanup*/
 out_free_name_buf:
 	kfree(phtable->name);
 out_free_phtable:
@@ -482,44 +604,13 @@ out_free_phtable:
 }
 
 /**
- * release_htable() - release the hash table for process
- * @pname: the name of the process
- */
-void release_htable(const char *pname, const pid_t pid, int mode)
-{
-	int bkt;
-	struct hash_table *phtable;
-	struct so_info *cur;
-	struct hlist_node *tmp = NULL;
-	u32 key = myhash(pname);
-	key += pid;
-
-	hash_for_each_possible (proc_htable, phtable, node, key) {
-		if (strcmp(phtable->name, pname) == 0 && pid == phtable->pid &&
-		    !hash_empty(phtable->htable)) {
-			hash_for_each_safe (phtable->htable, bkt, tmp, cur,
-					    node) {
-				hash_del(&cur->node);
-				if (mode == 1)
-					RELEASE_MEMORY(cur->ehframe);
-				RELEASE_MEMORY(cur->name);
-				kfree(cur);
-			}
-			hash_del(&phtable->node);
-			RELEASE_MEMORY(phtable->name);
-			kfree(phtable);
-		}
-	}
-	return;
-}
-
-/**
  * search_item() - search certain item in the hash table
  * by the name of process
  * @htable: the hash table of process
  * @soname: the name of the shared object
  */
-struct so_info *search_item(struct hash_table *phtable, const char *soname)
+static struct so_info *search_item(struct hash_table *phtable,
+				   const char *soname)
 {
 	struct so_info *item;
 	u32 key = myhash(soname);
@@ -534,9 +625,9 @@ struct so_info *search_item(struct hash_table *phtable, const char *soname)
  * insert_item() - insert item to the hash table
  * @htable: the hash table of process
  * @soname: the name of the shared object
- * @value : the address of struct so_info 
+ * @value : the address of struct so_info
  */
-int insert_item(struct hash_table *phtable, const char *soname)
+static int insert_item(struct hash_table *phtable, const char *soname)
 {
 	int retval = -1;
 	struct so_info *item;
@@ -544,16 +635,16 @@ int insert_item(struct hash_table *phtable, const char *soname)
 
 	item = kmalloc(sizeof(struct so_info), GFP_KERNEL);
 	if (!item) {
-		pr_err("[hsuck] %s, %d: buffer allocation failed\n", __FUNCTION__,
-		       __LINE__);
+		pr_err("[hsuck] %s, %d: buffer allocation failed\n",
+		       __FUNCTION__, __LINE__);
 		goto out;
 	}
 	memset(item, 0, sizeof(struct so_info));
 
 	item->name = kmalloc(strlen(soname) + 1, GFP_KERNEL);
 	if (!item->name) {
-		pr_err("[hsuck] %s, %d: buffer allocation failed\n", __FUNCTION__,
-		       __LINE__);
+		pr_err("[hsuck] %s, %d: buffer allocation failed\n",
+		       __FUNCTION__, __LINE__);
 		goto out_free_item;
 	}
 	memset(item->name, 0, strlen(soname) + 1);
@@ -572,37 +663,40 @@ static void fill_child_entry(void)
 {
 	struct hash_table *phtable;
 	struct so_info *item;
-	char libname[128] = "libc.so.6";
+	char libname[128] = "libc.so.6", *filepath;
 
-	phtable = search_htable(current->comm, current->pid);
+	filepath = get_task_full_comm(current);
+	phtable = search_htable(kbasename(filepath), task_pid_nr(current));
 	if (!phtable || hash_empty(phtable->htable))
-		return;
+		goto out;
 
 	if (phtable->clone_entry &&
 	    (phtable->child_main /*|| phtable->ngx_spawn_process*/))
-		return;
+		goto out;
 
 	item = search_item(phtable, libname);
 	if (!item) {
-		pr_debug("[hsuck] %s: %s is not found\n", __FUNCTION__, libname);
-		return;
+		pr_debug("[hsuck] %s: %s is not found\n", __FUNCTION__,
+			 libname);
+		goto out;
 	}
 
 	phtable->clone_entry = item->base_address + CLONE_ENTRY;
 	pr_debug("[hsuck] clone entry: %#0lx\n", phtable->clone_entry);
 
-	item = search_item(phtable, current->comm);
+	item = search_item(phtable, kbasename(filepath));
 	if (!item) {
 		pr_debug("[hsuck] %s: %s is not found\n", __FUNCTION__,
-			 current->comm);
-		return;
+			 kbasename(filepath));
+		goto out;
 	}
 
-	if (!strcmp("httpd", current->comm)) {
+	if (!strcmp("httpd", kbasename(filepath))) {
 		phtable->child_main = item->base_address + CHILD_MAIN;
 		pr_debug("[hsuck] child_main: %#0lx\n", phtable->child_main);
 	}
 
+out:
 	return;
 }
 
@@ -610,28 +704,39 @@ static void syscall_protection(void)
 {
 	int retval;
 	struct pt_regs *regs;
+	struct hash_table *phtable;
+	char *filepath = get_task_full_comm(current);
 
 	pr_debug("[hsuck] task is %s, pid=%d, ppname=%s, ppid=%d\n",
-		 current->comm, current->pid, current->real_parent->comm,
+		 kbasename(filepath), task_pid_nr(current), current->real_parent->comm,
 		 current->real_parent->pid);
 
 	mutex_lock(&sandbox_mutex);
 	mutex_unlock(&sandbox_mutex);
+	phtable = search_htable(kbasename(filepath), task_pid_nr(current));
+	if (!phtable || hash_empty(phtable->htable))
+		goto out;
+
+	if (phtable->is_static) {
+		/* pr_err("[hsuck] static linked\n"); */
+		goto unwind;
+	}
+
 	switch (is_all_filled()) {
 	case 0:
 		pr_debug("[hsuck] have not filled\n");
 		do {
 			retval = traverse_vma(0);
 		} while (retval == -EAGAIN);
-		fill_child_entry();
 		break;
 	case -1:
 		pr_err("[hsuck] %s, %d: hash table[%s, %d] is NULL or no entries\n",
-		       __FUNCTION__, __LINE__, current->comm,
+		       __FUNCTION__, __LINE__, kbasename(filepath),
 		       task_pid_nr(current));
 		goto out;
 	case 1:
 		pr_debug("[hsuck] have filled\n");
+		fill_child_entry();
 		break;
 	default:
 		break;
@@ -653,9 +758,11 @@ static void syscall_protection(void)
 		break;
 	}
 
+unwind:
 	unwind_stack();
 
 out:
+	
 	return;
 }
 
@@ -678,7 +785,7 @@ static int elf_read(struct file *file, void *buf, size_t len, loff_t pos)
  * Loads ELF section headers from the binary file elf_file, which has the ELF
  * header pointed to by elf_ex, into a newly allocated array. The caller is
  * responsible for freeing the allocated data. Returns NULL upon failure.
-*/
+ */
 static struct elf_shdr *load_elf_shdrs(const struct elfhdr *elf_ex,
 				       struct file *elf_file)
 {
@@ -713,7 +820,7 @@ out:
  * @elf_shdata: the start of the section header table
  *
  * Return NULL upon failure.
-*/
+ */
 static struct elf_shdr *elf_find_strtab(const struct elfhdr *elf_ex,
 					struct elf_shdr *elf_shdata)
 {
@@ -727,7 +834,7 @@ static struct elf_shdr *elf_find_strtab(const struct elfhdr *elf_ex,
  * @elf_shtab: the section header for table
  * @elf_file: the opened ELF binary file
  * Caller is responsible for freeing the buffer. Return NULL upon failure.
-*/
+ */
 static char *elf_fetch_tab(struct file *elf_file, struct elf_shdr *elf_shtab)
 {
 	char *tab = NULL;
@@ -760,7 +867,7 @@ out:
  * @symtab: the character buffer of the symbol table
  * @strtab: the character buffer of the string table
  * @func_name: the function name which we're looking for
-*/
+ */
 static Elf64_Sym *elf_get_funcsym(struct elf_shdr *elf_shsymtab, char *symtab,
 				  char *strtab, const char *func_name)
 {
@@ -891,7 +998,8 @@ static void lib_fetch_ehframe(const char *libname, struct file *libfile,
 	struct so_info *cur;
 	char *buf, *p;
 	char libpath[128] = "/usr/lib/";
-	char rpath[0x100] = "/home/hsuck/PAC-experiment/httpd-2.4.58-vanilla/root/lib/";
+	char rpath[0x100] =
+		"/home/hsuck/PAC-experiment/httpd-2.4.58-vanilla/root/lib/";
 
 	if ((!libname && !libfile) || !phtable)
 		return;
@@ -984,78 +1092,104 @@ loop_end:
 
 asmlinkage long hacked_openat(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `openat` is hooked, "
 			 "%s(%d)\n",
-			 current->comm, task_pid_nr(current));
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_openat(pt_regs);
 }
 
 asmlinkage long hacked_read(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `read` is hooked, "
 			 "%s(%d)\n",
-			 current->comm, task_pid_nr(current));
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_read(pt_regs);
 }
 
 asmlinkage long hacked_write(const struct pt_regs *pt_regs)
 {
+#if MEASURE_TIME == 1
+	struct timespec64 begin, end, ts;
+#endif
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `write` is hooked, "
 			 "%s(%d)\n",
-			 current->comm, task_pid_nr(current));
+			 kbasename(filepath), task_pid_nr(current));
+#if MEASURE_TIME == 1
+		ktime_get_ts64(&begin);
+#endif
 		syscall_protection();
+#if MEASURE_TIME == 1
+		ktime_get_ts64(&end);
+		ts = timespec64_sub(end, begin);
+		pr_info("[hsuck] time spent for syscall_protection, %lld (ns) elapsed\n",
+			timespec64_to_ns(&ts));
+#endif
 	}
+	
 	return orig_write(pt_regs);
 }
 
 asmlinkage long hacked_readv(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `readv` is hooked, "
 			 "%s(%d)\n",
-			 current->comm, task_pid_nr(current));
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_readv(pt_regs);
 }
 
 asmlinkage long hacked_writev(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `writev` is hooked, "
 			 "%s(%d)\n",
-			 current->comm, task_pid_nr(current));
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_writev(pt_regs);
 }
 
 asmlinkage long hacked_sendfile(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `sendfile` is hooked, "
 			 "%s(%d)\n",
-			 current->comm, task_pid_nr(current));
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_sendfile(pt_regs);
 }
 
 asmlinkage long hacked_recvfrom(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `recvfrom` is hooked, "
 			 "%s(%d)\n",
-			 current->comm, task_pid_nr(current));
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_recvfrom(pt_regs);
 }
 
@@ -1073,224 +1207,30 @@ asmlinkage long hacked_execve(const struct pt_regs *pt_regs)
 	struct elf_shdr *elf_shsymtab = NULL;
 	struct elf_shdr *elf_shdata, *elf_shent, *elf_shstrtab;
 	struct elfhdr elf_ex;
-	struct file *file;
+	struct file *file = NULL;
 	struct hash_table *htable = NULL;
 	struct so_info *proc_info;
 	unsigned int i;
 	unsigned long long filename = pt_regs->user_regs.regs[0];
-
-	/* Get file path from x0 register */
-	if (copy_from_user(filepath, (void __user *)filename, 0x100)) {
-		pr_err("[hsuck] %s, L%d: failed to read from user space, "
-		       "addr: %llx\n",
-		       __FUNCTION__, __LINE__, filename);
-		goto out;
-	}
-	pr_debug("[hsuck] filename: %s\n", filepath);
-
-	if (!delta_app_inlist(kbasename(filepath)))
-		goto out;
-	pr_info("[hsuck] monitoring %s\n", kbasename(filepath));
-
-	pr_debug("[vicky] syscall `execve` is hooked, "
-		 "%s(%d)\n",
-		 current->comm, task_pid_nr(current));
-
-	/* Open file */
-	file = filp_open(filepath, O_RDONLY | O_LARGEFILE, 0);
-	if (IS_ERR(file)) {
-		pr_err("[hsuck] %s, L%d: open %s failed\n", __FUNCTION__,
-			 __LINE__, filepath);
-		goto out;
-	}
-	if (WARN_ON_ONCE(!S_ISREG(file_inode(file)->i_mode)))
-		goto out;
-
-	/* Read elf header */
-	retval = elf_read(file, &elf_ex, sizeof(elf_ex), 0);
-	if (retval < 0)
-		goto out;
-
-	if (memcmp(elf_ex.e_ident, ELFMAG, SELFMAG) != 0)
-		goto out;
-
-	/* First of all, some simple consistency checks */
-	/* if (elf_ex.e_type != ET_DYN) */
-	/* 	goto out; */
-	if (!elf_check_arch(&elf_ex))
-		goto out;
-	if (elf_check_fdpic(&elf_ex))
-		goto out;
-	if (!file->f_op->mmap)
-		goto out;
-
-	/* Find the section header table */
-	elf_shdata = load_elf_shdrs(&elf_ex, file);
-	if (!elf_shdata) {
-		pr_err("[ztex] fail to load section table\n");
-		goto out;
-	}
-	elf_shstrtab = elf_find_strtab(&elf_ex, elf_shdata);
-	if (!elf_shstrtab) {
-		pr_err("[ztex] fail to find the section header for string table\n");
-		goto out_free_shdata;
-	}
-	shstrtab = elf_fetch_tab(file, elf_shstrtab);
-	if (!shstrtab) {
-		pr_err("[ztex] fail to find the string table\n");
-		goto out_free_shdata;
-	}
-
-	/* Create a hash table for the elf binary */
-	if (create_htable(kbasename(filepath), task_pid_nr(current), true) == -1) {
-		pr_err("[hsuck] %s, L%d: fuck\n", __FUNCTION__, __LINE__);
-		goto out_free_strtab;
-	}
-	if (!(htable = search_htable(kbasename(filepath),
-				     task_pid_nr(current)))) {
-		pr_err("[hsuck] %s, L%d: %s, htable not found\n", __FUNCTION__,
-		       __LINE__, kbasename(filepath));
-		goto out_free_strtab;
-	}
-
-	/* Create a hash table entry for the elf binary */
-	insert_item(htable, kbasename(filepath));
-	proc_info = search_item(htable, kbasename(filepath));
-
-	elf_shent = elf_shdata;
-	for (i = 0; i < elf_ex.e_shnum; i++, elf_shent++) {
-		if (strcmp(".eh_frame", shstrtab + elf_shent->sh_name) == 0) {
-			pr_debug("[ztex] found .eh_frame in %s\n",
-				 kbasename(filepath));
-			pr_debug("[hsuck] start: %#0llx, size: %#0llx\n",
-				 elf_shent->sh_addr, elf_shent->sh_size);
-			proc_info->eh_frame_start = elf_shent->sh_addr;
-			proc_info->eh_frame_size = elf_shent->sh_size;
-			proc_info->eh_frame_found = 1;
-			continue;
-		}
-		if (strcmp(".plt", shstrtab + elf_shent->sh_name) == 0) {
-			pr_debug("[ztex] found .plt in %s\n",
-				 kbasename(filepath));
-			pr_debug("[hsuck] start: %#0llx, size: %#0llx\n",
-				 elf_shent->sh_addr, elf_shent->sh_size);
-			proc_info->plt_start = elf_shent->sh_addr;
-			proc_info->plt_size = elf_shent->sh_size;
-			proc_info->plt_found = 1;
-			continue;
-		}
-		if (strcmp(".strtab", shstrtab + elf_shent->sh_name) == 0) {
-			strtab = elf_fetch_tab(file, elf_shent);
-			if (!strtab) {
-				pr_err("[ztex] cannot found .strtab in %s\n",
-				       kbasename(filepath));
-			}
-			pr_debug("[hsuck] found .strtab in %s\n",
-				 kbasename(filepath));
-			continue;
-		}
-		if (strcmp(".symtab", shstrtab + elf_shent->sh_name) == 0) {
-			symtab = elf_fetch_tab(file, elf_shent);
-			if (!symtab) {
-				pr_err("[ztex] cannot found .symtab in %s\n",
-				       kbasename(filepath));
-			}
-			pr_debug("[ztex] found .symtab in %s\n",
-				 kbasename(filepath));
-			elf_shsymtab = elf_shent;
-			continue;
-		}
-		if (strcmp(".dynstr", shstrtab + elf_shent->sh_name) == 0) {
-			dynstr = elf_fetch_tab(file, elf_shent);
-			if (!dynstr) {
-				pr_err("[hsuck] cannot found dynstr in %s\n",
-				       kbasename(filepath));
-			}
-			pr_debug("[hsuck] found .dynstr in %s\n",
-				 kbasename(filepath));
-			continue;
-		}
-		if (strcmp(".dynamic", shstrtab + elf_shent->sh_name) == 0) {
-			dynamic = elf_fetch_tab(file, elf_shent);
-			if (!dynamic) {
-				pr_err("[hsuck] cannot found dynamic in %s\n",
-				       kbasename(filepath));
-			}
-			pr_debug("[hsuck] found .dynamic in %s\n",
-				 kbasename(filepath));
-			elf_shdynamic = elf_shent;
-			continue;
-		}
-	}
-
-	sym = elf_get_funcsym(elf_shsymtab, symtab, strtab, TERMINATE_FUNCTION);
-	if (!sym) {
-		pr_err("[ztex] fail to find the symbol of the terminate function,"
-		       TERMINATE_FUNCTION "\n");
-		htable->elf_entry_found = 0;
-		goto out_free_tabs;
-	}
-	htable->elf_entry_found = 1;
-	htable->elf_entry = sym->st_value;
-	pr_debug("[ztex] the terminate function address: 0x%lx\n", htable->elf_entry);
-
-	elf_get_so(elf_shdynamic, dynamic, dynstr, htable);
-
-out_free_tabs:
-	RELEASE_MEMORY(strtab);
-	RELEASE_MEMORY(symtab);
-	RELEASE_MEMORY(dynstr);
-	RELEASE_MEMORY(dynamic);
-out_free_strtab:
-	RELEASE_MEMORY(shstrtab);
-out_free_shdata:
-	RELEASE_MEMORY(elf_shdata);
-
-	if (delta_app_inlist(current->comm))
-		syscall_protection();
-out:
-	retval = orig_execve(pt_regs);
-	if (elf_ex.e_type != ET_DYN)
-		while (traverse_vma(0) == -EAGAIN)
-			;
-	return retval;
-}
-
-asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
-{
-	char filepath[0x100];
-	char *dynamic = NULL;
-	char *dynstr = NULL;
-	char *shstrtab = NULL;
-	char *strtab = NULL;
-	char *symtab = NULL;
-	Elf64_Sym *sym = NULL;
-	int retval;
-	struct elf_shdr *elf_shdynamic = NULL;
-	struct elf_shdr *elf_shsymtab = NULL;
-	struct elf_shdr *elf_shdata, *elf_shent, *elf_shstrtab;
-	struct elfhdr elf_ex;
-	struct file *file;
-	struct hash_table *htable = NULL;
-	struct so_info *proc_info;
-	unsigned int i;
-	unsigned long long filename = pt_regs->user_regs.regs[0];
-
-	/* Get file path from x0 register */
-	if (copy_from_user(filepath, (void __user *)filename, 0x100)) {
-		pr_err("[hsuck] %s, L%d: failed to read from user space, "
-		       "addr: %llx\n",
-		       __FUNCTION__, __LINE__, filename);
-		goto out;
-	}
-	pr_debug("[hsuck] filename: %s\n", filepath);
-
-	if (!delta_app_inlist(kbasename(filepath)))
-		goto out;
 
 	pr_debug("[vicky] syscall `execveat` is hooked, "
 		 "%s(%d)\n",
 		 current->comm, task_pid_nr(current));
+
+	/* Get file path from x0 register */
+	if (copy_from_user(filepath, (void __user *)filename, 0x100)) {
+		pr_err("[hsuck] %s, L%d: failed to read from user space, "
+		       "addr: %llx\n",
+		       __FUNCTION__, __LINE__, filename);
+		goto out;
+	}
+	pr_debug("[hsuck] filename: %s\n", filepath);
+
+	if (!delta_app_inlist(current->comm))
+		goto out;
+
+	pr_info("[hsuck] monitoring %s(%d)\n", kbasename(filepath),
+		task_pid_nr(current));
 
 	/* Open file */
 	file = filp_open(filepath, O_RDONLY | O_LARGEFILE, 0);
@@ -1303,14 +1243,15 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 		goto out;
 
 	/* Read elf header */
-	retval = elf_read(file, &elf_ex, sizeof(elf_ex), 0);
-	if (retval < 0)
+	if (elf_read(file, &elf_ex, sizeof(elf_ex), 0) < 0)
 		goto out;
 
 	if (memcmp(elf_ex.e_ident, ELFMAG, SELFMAG) != 0)
 		goto out;
 
 	/* First of all, some simple consistency checks */
+	/* if (elf_ex.e_type != ET_DYN) */
+	/*	goto out; */
 	if (!elf_check_arch(&elf_ex))
 		goto out;
 	if (elf_check_fdpic(&elf_ex))
@@ -1336,7 +1277,10 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 	}
 
 	/* Create a hash table for the elf binary */
-	if (create_htable(kbasename(filepath), task_pid_nr(current), true) == -1) {
+	pr_debug("[hsuck] create hash table for %s(%d)\n", kbasename(filepath),
+		 task_pid_nr(current));
+	if (create_htable(kbasename(filepath), task_pid_nr(current), true) ==
+	    -1) {
 		pr_err("[hsuck] %s, L%d: fuck\n", __FUNCTION__, __LINE__);
 		goto out_free_strtab;
 	}
@@ -1429,7 +1373,18 @@ asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
 	pr_debug("[ztex] the terminate function address: 0x%lx\n",
 		 htable->elf_entry);
 
-	elf_get_so(elf_shdynamic, dynamic, dynstr, htable);
+	sym = elf_get_funcsym(elf_shsymtab, symtab, strtab, "_start");
+	if (!sym) {
+		pr_err("[ztex] fail to find the symbol of the terminate function, _start\n");
+		goto out_free_tabs;
+	}
+	htable->start = sym->st_value;
+	pr_info("[ztex] the terminate function (_start) address: 0x%lx\n",
+		htable->start);
+
+	htable->is_static = elf_ex.e_type != ET_DYN ? 1 : 0;
+	if (!htable->is_static)
+		elf_get_so(elf_shdynamic, dynamic, dynstr, htable);
 
 out_free_tabs:
 	RELEASE_MEMORY(strtab);
@@ -1445,108 +1400,331 @@ out_free_shdata:
 		syscall_protection();
 out:
 	retval = orig_execve(pt_regs);
-	if (elf_ex.e_type != ET_DYN)
-		while (traverse_vma(0) == -EAGAIN)
-			;
+	/* while (traverse_vma(0) == -EAGAIN) */
+	/*	; */
+	if (file)
+		filp_close(file, NULL);
+
+	return retval;
+}
+
+asmlinkage long hacked_execveat(const struct pt_regs *pt_regs)
+{
+	char filepath[0x100];
+	char *dynamic = NULL;
+	char *dynstr = NULL;
+	char *shstrtab = NULL;
+	char *strtab = NULL;
+	char *symtab = NULL;
+	Elf64_Sym *sym = NULL;
+	int retval;
+	struct elf_shdr *elf_shdynamic = NULL;
+	struct elf_shdr *elf_shsymtab = NULL;
+	struct elf_shdr *elf_shdata, *elf_shent, *elf_shstrtab;
+	struct elfhdr elf_ex;
+	struct file *file;
+	struct hash_table *htable = NULL;
+	struct so_info *proc_info;
+	unsigned int i;
+	unsigned long long filename = pt_regs->user_regs.regs[0];
+
+	pr_debug("[vicky] syscall `execveat` is hooked, "
+		 "%s(%d)\n",
+		 current->comm, task_pid_nr(current));
+
+	/* Get file path from x0 register */
+	if (copy_from_user(filepath, (void __user *)filename, 0x100)) {
+		pr_err("[hsuck] %s, L%d: failed to read from user space, "
+		       "addr: %llx\n",
+		       __FUNCTION__, __LINE__, filename);
+		goto out;
+	}
+	pr_debug("[hsuck] filename: %s\n", filepath);
+
+	if (!delta_app_inlist(current->comm))
+		goto out;
+
+	pr_info("[hsuck] monitoring %s(%d)\n", kbasename(filepath),
+		task_pid_nr(current));
+
+	/* Open file */
+	file = filp_open(filepath, O_RDONLY | O_LARGEFILE, 0);
+	if (IS_ERR(file)) {
+		pr_err("[hsuck] %s, L%d: open %s failed\n", __FUNCTION__,
+		       __LINE__, filepath);
+		goto out;
+	}
+	if (WARN_ON_ONCE(!S_ISREG(file_inode(file)->i_mode)))
+		goto out;
+
+	/* Read elf header */
+	retval = elf_read(file, &elf_ex, sizeof(elf_ex), 0);
+	if (retval < 0)
+		goto out;
+
+	if (memcmp(elf_ex.e_ident, ELFMAG, SELFMAG) != 0)
+		goto out;
+
+	/* First of all, some simple consistency checks */
+	if (!elf_check_arch(&elf_ex))
+		goto out;
+	if (elf_check_fdpic(&elf_ex))
+		goto out;
+	if (!file->f_op->mmap)
+		goto out;
+
+	/* Find the section header table */
+	elf_shdata = load_elf_shdrs(&elf_ex, file);
+	if (!elf_shdata) {
+		pr_err("[ztex] fail to load section table\n");
+		goto out;
+	}
+	elf_shstrtab = elf_find_strtab(&elf_ex, elf_shdata);
+	if (!elf_shstrtab) {
+		pr_err("[ztex] fail to find the section header for string table\n");
+		goto out_free_shdata;
+	}
+	shstrtab = elf_fetch_tab(file, elf_shstrtab);
+	if (!shstrtab) {
+		pr_err("[ztex] fail to find the string table\n");
+		goto out_free_shdata;
+	}
+
+	/* Create a hash table for the elf binary */
+	if (create_htable(kbasename(filepath), task_pid_nr(current), true) ==
+	    -1) {
+		pr_err("[hsuck] %s, L%d: fuck\n", __FUNCTION__, __LINE__);
+		goto out_free_strtab;
+	}
+	if (!(htable = search_htable(kbasename(filepath),
+				     task_pid_nr(current)))) {
+		pr_err("[hsuck] %s, L%d: %s, htable not found\n", __FUNCTION__,
+		       __LINE__, kbasename(filepath));
+		goto out_free_strtab;
+	}
+
+	/* Create a hash table entry for the elf binary */
+	insert_item(htable, kbasename(filepath));
+	proc_info = search_item(htable, kbasename(filepath));
+
+	elf_shent = elf_shdata;
+	for (i = 0; i < elf_ex.e_shnum; i++, elf_shent++) {
+		if (strcmp(".eh_frame", shstrtab + elf_shent->sh_name) == 0) {
+			pr_debug("[ztex] found .eh_frame in %s\n",
+				 kbasename(filepath));
+			pr_debug("[hsuck] start: %#0llx, size: %#0llx\n",
+				 elf_shent->sh_addr, elf_shent->sh_size);
+			proc_info->eh_frame_start = elf_shent->sh_addr;
+			proc_info->eh_frame_size = elf_shent->sh_size;
+			proc_info->eh_frame_found = 1;
+			continue;
+		}
+		if (strcmp(".plt", shstrtab + elf_shent->sh_name) == 0) {
+			pr_debug("[ztex] found .plt in %s\n",
+				 kbasename(filepath));
+			pr_debug("[hsuck] start: %#0llx, size: %#0llx\n",
+				 elf_shent->sh_addr, elf_shent->sh_size);
+			proc_info->plt_start = elf_shent->sh_addr;
+			proc_info->plt_size = elf_shent->sh_size;
+			proc_info->plt_found = 1;
+			continue;
+		}
+		if (strcmp(".strtab", shstrtab + elf_shent->sh_name) == 0) {
+			strtab = elf_fetch_tab(file, elf_shent);
+			if (!strtab) {
+				pr_err("[ztex] cannot found .strtab in %s\n",
+				       kbasename(filepath));
+			}
+			pr_debug("[hsuck] found .strtab in %s\n",
+				 kbasename(filepath));
+			continue;
+		}
+		if (strcmp(".symtab", shstrtab + elf_shent->sh_name) == 0) {
+			symtab = elf_fetch_tab(file, elf_shent);
+			if (!symtab) {
+				pr_err("[ztex] cannot found .symtab in %s\n",
+				       kbasename(filepath));
+			}
+			pr_debug("[ztex] found .symtab in %s\n",
+				 kbasename(filepath));
+			elf_shsymtab = elf_shent;
+			continue;
+		}
+		if (strcmp(".dynstr", shstrtab + elf_shent->sh_name) == 0) {
+			dynstr = elf_fetch_tab(file, elf_shent);
+			if (!dynstr) {
+				pr_err("[hsuck] cannot found dynstr in %s\n",
+				       kbasename(filepath));
+			}
+			pr_debug("[hsuck] found .dynstr in %s\n",
+				 kbasename(filepath));
+			continue;
+		}
+		if (strcmp(".dynamic", shstrtab + elf_shent->sh_name) == 0) {
+			dynamic = elf_fetch_tab(file, elf_shent);
+			if (!dynamic) {
+				pr_err("[hsuck] cannot found dynamic in %s\n",
+				       kbasename(filepath));
+			}
+			pr_debug("[hsuck] found .dynamic in %s\n",
+				 kbasename(filepath));
+			elf_shdynamic = elf_shent;
+			continue;
+		}
+	}
+
+	sym = elf_get_funcsym(elf_shsymtab, symtab, strtab, TERMINATE_FUNCTION);
+	if (!sym) {
+		pr_err("[ztex] fail to find the symbol of the terminate function," TERMINATE_FUNCTION
+		       "\n");
+		htable->elf_entry_found = 0;
+		goto out_free_tabs;
+	}
+	htable->elf_entry_found = 1;
+	htable->elf_entry = sym->st_value;
+	pr_debug("[ztex] the terminate function address: 0x%lx\n",
+		 htable->elf_entry);
+
+	htable->is_static = elf_ex.e_type != ET_DYN ? 1 : 0;
+	if (!htable->is_static)
+		elf_get_so(elf_shdynamic, dynamic, dynstr, htable);
+
+out_free_tabs:
+	RELEASE_MEMORY(strtab);
+	RELEASE_MEMORY(symtab);
+	RELEASE_MEMORY(dynstr);
+	RELEASE_MEMORY(dynamic);
+out_free_strtab:
+	RELEASE_MEMORY(shstrtab);
+out_free_shdata:
+	RELEASE_MEMORY(elf_shdata);
+
+	if (delta_app_inlist(current->comm))
+		syscall_protection();
+out:
+	retval = orig_execveat(pt_regs);
+	/* while (traverse_vma(0) == -EAGAIN) */
+	/*	; */
+	if (file)
+		filp_close(file, NULL);
+
 	return retval;
 }
 
 asmlinkage long hacked_mprotect(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `mprotect` is hooked, "
-			"%s(%d)\n",
-			current->comm, task_pid_nr(current));
+			 "%s(%d)\n",
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_mprotect(pt_regs);
 }
 
 asmlinkage long hacked_mmap(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `mmap` is hooked, "
-			"%s(%d)\n",
-			current->comm, task_pid_nr(current));
+			 "%s(%d)\n",
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_mmap(pt_regs);
 }
 
 asmlinkage long hacked_mremap(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `mremap` is hooked, "
 			 "%s(%d)\n",
-			 current->comm, task_pid_nr(current));
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_mremap(pt_regs);
 }
 
 asmlinkage long hacked_socket(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `socket` is hooked, "
-			"%s(%d)\n",
-			current->comm, task_pid_nr(current));
+			 "%s(%d)\n",
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_socket(pt_regs);
 }
 
 asmlinkage long hacked_bind(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `bind` is hooked, "
-			"%s(%d)\n",
-			current->comm, task_pid_nr(current));
+			 "%s(%d)\n",
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_bind(pt_regs);
 }
 
 asmlinkage long hacked_connect(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `connect` is hooked, "
-			"%s(%d)\n",
-			current->comm, task_pid_nr(current));
+			 "%s(%d)\n",
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_connect(pt_regs);
 }
 
 asmlinkage long hacked_listen(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `listen` is hooked, "
-			"%s(%d)\n",
-			current->comm, task_pid_nr(current));
+			 "%s(%d)\n",
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_listen(pt_regs);
 }
 
 asmlinkage long hacked_accept(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `accept` is hooked, "
-			"%s(%d)\n",
-			current->comm, task_pid_nr(current));
+			 "%s(%d)\n",
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_accept(pt_regs);
 }
 
 asmlinkage long hacked_accept4(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `accept4` is hooked, "
-			"%s(%d)\n",
-			current->comm, task_pid_nr(current));
+			 "%s(%d)\n",
+			 kbasename(filepath), task_pid_nr(current));
 		syscall_protection();
 	}
+	
 	return orig_accept4(pt_regs);
 }
 
@@ -1557,7 +1735,8 @@ static void copy_table(table_t *ptable, table_t *ctable)
 	ctable->header      = ptable->header;
 	ctable->hdrsz       = ptable->hdrsz;
 	ctable->state_cache = ptable->state_cache;
-	get_task_comm(ctable->name, current);
+	ctable->num_caches  = ptable->num_caches;
+	/* ctable->name        = get_task_full_comm(current); */
 
 	return;
 }
@@ -1570,11 +1749,13 @@ asmlinkage long hacked_clone(const struct pt_regs *pt_regs)
 	struct task_struct *t;
 	struct hash_table *pphtable, *cphtable;
 	struct so_info *cur, *item;
+	char *parent_name, *child_name;
 
-	if (delta_app_inlist(current->comm)) {
+	parent_name = get_task_full_comm(current);
+	if (delta_app_inlist(kbasename(parent_name))) {
 		pr_debug("[vicky] syscall `clone` is hooked, "
-			"%s(%d)\n",
-			current->comm, task_pid_nr(current));
+			 "%s(%d)\n",
+			 kbasename(parent_name), task_pid_nr(current));
 		syscall_protection();
 	}
 
@@ -1587,26 +1768,28 @@ asmlinkage long hacked_clone(const struct pt_regs *pt_regs)
 		goto out;
 	}
 
-	if (delta_app_inlist(current->comm) && !strcmp(current->comm, t->comm)) {
-		pr_debug("[vicky] syscall `clone` is hooked, "
-			 "%s, pid=%d, cpid=%d\n",
-			 current->comm, task_pid_nr(current), task_pid_nr(t));
-
+	child_name = get_task_full_comm(t);
+	if (delta_app_inlist(kbasename(parent_name)) &&
+	    !strcmp(kbasename(parent_name), kbasename(child_name))) {
 		/* Find hash table of parent */
-		if (!(pphtable = search_htable(current->comm, current->pid))) {
+		if (!(pphtable = search_htable(kbasename(parent_name),
+					       task_pid_nr(current)))) {
 			pr_err("[hsuck] %s, %d: %s, %d htable not found\n",
-			       __FUNCTION__, __LINE__, current->comm,
-			       current->pid);
+			       __FUNCTION__, __LINE__, kbasename(parent_name),
+			       task_pid_nr(current));
 			goto out;
 		}
 		/* Create hash table for children */
-		if (create_htable(t->comm, task_pid_nr(t), false) == -1) {
+		if (create_htable(kbasename(child_name), task_pid_nr(t),
+				  false) == -1) {
 			pr_err("[hsuck] %d: fuck", __LINE__);
 			goto out;
 		}
-		if (!(cphtable = search_htable(t->comm, task_pid_nr(t)))) {
+		if (!(cphtable = search_htable(kbasename(child_name),
+					       task_pid_nr(t)))) {
 			pr_err("[hsuck] %s, %d: %s, %d htable not found\n",
-			       __FUNCTION__, __LINE__, t->comm, task_pid_nr(t));
+			       __FUNCTION__, __LINE__, kbasename(child_name),
+			       task_pid_nr(t));
 			goto out;
 		}
 		/* Insert entries of parent's table to children's table */
@@ -1677,7 +1860,7 @@ copy_htable:
 		cphtable->cntr              = pphtable->cntr;
 
 		/* pr_debug("[hsuck] cntr: %s, %d\n", pphtable->name, */
-		/* 	atomic_inc_return(pphtable->cntr)); */
+		/*	atomic_inc_return(pphtable->cntr)); */
 		atomic_inc(pphtable->cntr);
 		pr_debug("[hsuck] copy metadata successfully from %d to %d\n",
 			 task_pid_nr(current), task_pid_nr(t));
@@ -1687,113 +1870,173 @@ out:
 	return retval;
 }
 
-static void release_partial(void)
+static void release_partial(struct hash_table **phtab)
 {
-	struct hash_table *phtable = search_htable(current->comm, current->pid);
+	int bkt;
+	struct so_info *scur;
+	struct hlist_node *htmp = NULL;
+	table_t *tmp, *cur;
+	struct hash_table *phtable = *phtab;
 
-	pr_debug("[hsuck] %s: %s(%d)\n", __FUNCTION__, current->comm,
-		 current->pid);
+	// free unwind_table
+	pr_debug("[hsuck] freeing unwind_table...\n");
+	cur = phtable->root_table;
+	if (!cur)
+		goto out_free_htable;
+	do {
+		tmp = cur;
+		cur = cur->next;
+		pr_debug("[hsuck] (%s, %d)\n", tmp->info->name, phtable->pid);
+		RELEASE_MEMORY(tmp);
+	} while (cur && cur != phtable->root_table);
+	(*phtab)->root_table = NULL;
 
-	if (!phtable) {
-		pr_err("[hsuck] %s, %d: %s(%d) htable not found\n", __FUNCTION__,
-		       __LINE__, current->comm, current->pid);
-		goto out;
-	}
+out_free_htable:
+	// free so_info
+	pr_debug("[hsuck] freeing so_info...\n");
+	if (!hash_empty(phtable->htable))
+		hash_for_each_safe (phtable->htable, bkt, htmp, scur, node) {
+			pr_debug("[hsuck] (%s, %d)\n", scur->name,
+				 phtable->pid);
+			hash_del(&scur->node);
+			RELEASE_MEMORY(scur->name);
+			kfree(scur);
+		}
 
-	deinit_unwind_table(phtable, 0);
-	release_htable(current->comm, current->pid, 0);
-out:
+	// free hash_table
+	hash_del(&phtable->node);
+	RELEASE_MEMORY(phtable->name);
+	kfree(phtable);
+	(*phtab) = NULL;
 	return;
 }
 
-static void release_all(void)
+static void release_all(struct hash_table **phtab)
 {
-	struct hash_table *phtable = search_htable(current->comm, current->pid);
+	int i, bkt;
+	struct so_info *scur;
+	struct hlist_node *htmp = NULL;
+	table_t *tmp, *cur;
+	struct hash_table *phtable = *phtab;
 
-	pr_debug("[hsuck] %s: %s(%d)\n", __FUNCTION__, current->comm,
-		 current->pid);
+	// free unwind_table
+	pr_info("[hsuck] freeing unwind_table...\n");
+	cur = phtable->root_table;
+	if (!cur)
+		goto out_free_htable;
+	do {
+		tmp = cur;
+		cur = cur->next;
+		RELEASE_MEMORY(tmp->header);
+		pr_info("[hsuck] (%s, %d) cachesz=%u\n", tmp->info->name,
+			 phtable->pid, tmp->num_caches);
+		for (i = 0; i < tmp->num_caches; ++i)
+			RELEASE_MEMORY(tmp->state_cache[i]);
+		RELEASE_MEMORY(tmp->state_cache);
+		RELEASE_MEMORY(tmp);
+	} while (cur && cur != phtable->root_table);
+	(*phtab)->root_table = NULL;
 
-	if (!phtable) {
-		pr_err("[hsuck] %s:%d %s:%d htable not found\n", __FUNCTION__,
-		       __LINE__, current->comm, current->pid);
-		goto out;
-	}
+out_free_htable:
+	pr_info("[hsuck] freeing so_info...\n");
+	// free so_info
+	if (!hash_empty(phtable->htable))
+		hash_for_each_safe (phtable->htable, bkt, htmp, scur, node) {
+			pr_info("[hsuck] (%s, %d)\n", scur->name,
+				 phtable->pid);
+			hash_del(&scur->node);
+			RELEASE_MEMORY(scur->ehframe);
+			RELEASE_MEMORY(scur->name);
+			kfree(scur);
+		}
+	hash_del(&phtable->node);
+	RELEASE_MEMORY(phtable->name);
+	RELEASE_MEMORY(phtable->cntr);
+	kfree(phtable);
+	(*phtab) = NULL;
 
-	deinit_unwind_table(phtable, 1);
-	release_htable(current->comm, current->pid, 1);
-out:
 	return;
 }
 
 static void release_memory(void)
 {
 	int retval;
-	struct hash_table *phtable = search_htable(current->comm, current->pid);
+	char *filepath = get_task_full_comm(current);
+	struct hash_table *phtable =
+		search_htable(kbasename(filepath), task_pid_nr(current));
 
-	mutex_lock(&sandbox_mutex);
+	pr_debug("[hsuck] release metadata for (%s, %d)\n", kbasename(filepath),
+		 task_pid_nr(current));
 	if (!phtable) {
 		pr_err("[hsuck] %s:%d %s:%d htable not found\n", __FUNCTION__,
-		       __LINE__, current->comm, current->pid);
+		       __LINE__, kbasename(filepath), task_pid_nr(current));
 		goto out;
 	}
 
 	if (!phtable->cntr) {
 		pr_err("[hsuck] %s:%d %s:%d cntr not found\n", __FUNCTION__,
-		       __LINE__, current->comm, current->pid);
+		       __LINE__, kbasename(filepath), task_pid_nr(current));
 		goto out;
 	}
 
 	retval = atomic_dec_return(phtable->cntr);
-	pr_debug("[hsuck] cntr: %s, %d\n", phtable->name, retval);
-	if (!retval)
-		release_all();
-	else
-		release_partial();
+	pr_info("[hsuck] cntr: %s(%d), %d\n", phtable->name, phtable->pid,
+		retval);
+
+	if (!retval) {
+		release_all(&phtable);
+	} else {
+		release_partial(&phtable);
+	}
 out:
-	mutex_unlock(&sandbox_mutex);
+	
 	return;
 }
 
 asmlinkage long hacked_exit(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `exit` is hooked, "
 			 "%s(%d)\n",
-			 current->comm, task_pid_nr(current));
+			 kbasename(filepath), task_pid_nr(current));
 		release_memory();
 	}
+	
 	return orig_exit(pt_regs);
 }
 
 asmlinkage long hacked_exit_group(const struct pt_regs *pt_regs)
 {
+	char *filepath = get_task_full_comm(current);
 	if (delta_app_inlist(current->comm)) {
 		pr_debug("[vicky] syscall `exit_group` is hooked, "
 			 "%s(%d)\n",
-			 current->comm, task_pid_nr(current));
+			 kbasename(filepath), task_pid_nr(current));
 		release_memory();
 	}
+	
 	return orig_exit_group(pt_regs);
 }
 
 static int __hook_syscall(void)
 {
 	/* File system related */
-	orig_openat     = (sys_call_t)__sys_call_table[__NR_openat];
-	orig_read       = (sys_call_t)__sys_call_table[__NR_read];
-	orig_write      = (sys_call_t)__sys_call_table[__NR_write];
-	orig_readv      = (sys_call_t)__sys_call_table[__NR_readv];
-	orig_writev     = (sys_call_t)__sys_call_table[__NR_writev];
-	orig_sendfile   = (sys_call_t)__sys_call_table[__NR_sendfile];
-	orig_recvfrom   = (sys_call_t)__sys_call_table[__NR_recvfrom];
+	/* orig_openat     = (sys_call_t)__sys_call_table[__NR_openat]; */
+	/* orig_read       = (sys_call_t)__sys_call_table[__NR_read]; */
+	/* orig_write      = (sys_call_t)__sys_call_table[__NR_write]; */
+	/* orig_readv      = (sys_call_t)__sys_call_table[__NR_readv]; */
+	/* orig_writev     = (sys_call_t)__sys_call_table[__NR_writev]; */
+	/* orig_sendfile   = (sys_call_t)__sys_call_table[__NR_sendfile]; */
+	/* orig_recvfrom   = (sys_call_t)__sys_call_table[__NR_recvfrom]; */
 	/* Arbitrary Code Execution */
 	orig_execve     = (sys_call_t)__sys_call_table[__NR_execve];
 	orig_execveat   = (sys_call_t)__sys_call_table[__NR_execveat];
 	orig_clone      = (sys_call_t)__sys_call_table[__NR_clone];
 	/* Memory Permissions */
-	orig_mprotect   = (sys_call_t)__sys_call_table[__NR_mprotect];
-	orig_mmap       = (sys_call_t)__sys_call_table[__NR_mmap];
-	orig_mremap     = (sys_call_t)__sys_call_table[__NR_mremap];
+	/* orig_mprotect   = (sys_call_t)__sys_call_table[__NR_mprotect]; */
+	/* orig_mmap       = (sys_call_t)__sys_call_table[__NR_mmap]; */
+	/* orig_mremap     = (sys_call_t)__sys_call_table[__NR_mremap]; */
 	/* Networking */
 	orig_socket     = (sys_call_t)__sys_call_table[__NR_socket];
 	orig_bind       = (sys_call_t)__sys_call_table[__NR_bind];
@@ -1806,21 +2049,21 @@ static int __hook_syscall(void)
 	orig_exit_group = (sys_call_t)__sys_call_table[__NR_exit_group];
 
 	/* File system related */
-	__sys_call_table[__NR_openat]     = (unsigned long)hacked_openat;
-	__sys_call_table[__NR_read]       = (unsigned long)hacked_read;
-	__sys_call_table[__NR_write]      = (unsigned long)hacked_write;
-	__sys_call_table[__NR_readv]      = (unsigned long)hacked_readv;
-	__sys_call_table[__NR_writev]     = (unsigned long)hacked_writev;
-	__sys_call_table[__NR_sendfile]   = (unsigned long)hacked_sendfile;
-	__sys_call_table[__NR_recvfrom]   = (unsigned long)hacked_recvfrom;
+	/* __sys_call_table[__NR_openat]     = (unsigned long)hacked_openat; */
+	/* __sys_call_table[__NR_read]       = (unsigned long)hacked_read; */
+	/* __sys_call_table[__NR_write]      = (unsigned long)hacked_write; */
+	/* __sys_call_table[__NR_readv]      = (unsigned long)hacked_readv; */
+	/* __sys_call_table[__NR_writev]     = (unsigned long)hacked_writev; */
+	/* __sys_call_table[__NR_sendfile]   = (unsigned long)hacked_sendfile; */
+	/* __sys_call_table[__NR_recvfrom]   = (unsigned long)hacked_recvfrom; */
 	/* Arbitrary Code Execution */
 	__sys_call_table[__NR_execve]     = (unsigned long)hacked_execve;
 	__sys_call_table[__NR_execveat]   = (unsigned long)hacked_execveat;
 	__sys_call_table[__NR_clone]      = (unsigned long)hacked_clone;
 	/* Memory Permissions */
-	__sys_call_table[__NR_mprotect]   = (unsigned long)hacked_mprotect;
-	__sys_call_table[__NR_mmap]       = (unsigned long)hacked_mmap;
-	__sys_call_table[__NR_mremap]     = (unsigned long)hacked_mremap;
+	/* __sys_call_table[__NR_mprotect]   = (unsigned long)hacked_mprotect; */
+	/* __sys_call_table[__NR_mmap]       = (unsigned long)hacked_mmap; */
+	/* __sys_call_table[__NR_mremap]     = (unsigned long)hacked_mremap; */
 	/* Networking */
 	__sys_call_table[__NR_socket]     = (unsigned long)hacked_socket;
 	__sys_call_table[__NR_bind]       = (unsigned long)hacked_bind;
@@ -1838,21 +2081,21 @@ static int __hook_syscall(void)
 static void __unhook_syscall(void)
 {
 	/* File system related */
-	__sys_call_table[__NR_openat]     = (unsigned long)orig_openat;
-	__sys_call_table[__NR_read]       = (unsigned long)orig_read;
-	__sys_call_table[__NR_write]      = (unsigned long)orig_write;
-	__sys_call_table[__NR_readv]      = (unsigned long)orig_readv;
-	__sys_call_table[__NR_writev]     = (unsigned long)orig_writev;
-	__sys_call_table[__NR_sendfile]   = (unsigned long)orig_sendfile;
-	__sys_call_table[__NR_recvfrom]   = (unsigned long)orig_recvfrom;
+	/* __sys_call_table[__NR_openat]     = (unsigned long)orig_openat; */
+	/* __sys_call_table[__NR_read]       = (unsigned long)orig_read; */
+	/* __sys_call_table[__NR_write]      = (unsigned long)orig_write; */
+	/* __sys_call_table[__NR_readv]      = (unsigned long)orig_readv; */
+	/* __sys_call_table[__NR_writev]     = (unsigned long)orig_writev; */
+	/* __sys_call_table[__NR_sendfile]   = (unsigned long)orig_sendfile; */
+	/* __sys_call_table[__NR_recvfrom]   = (unsigned long)orig_recvfrom; */
 	/* Arbitrary Code Execution */
 	__sys_call_table[__NR_execve]     = (unsigned long)orig_execve;
 	__sys_call_table[__NR_execveat]   = (unsigned long)orig_execveat;
 	__sys_call_table[__NR_clone]      = (unsigned long)orig_clone;
 	/* Memory Permissions */
-	__sys_call_table[__NR_mprotect]   = (unsigned long)orig_mprotect;
-	__sys_call_table[__NR_mmap]       = (unsigned long)orig_mmap;
-	__sys_call_table[__NR_mremap]     = (unsigned long)orig_mremap;
+	/* __sys_call_table[__NR_mprotect]   = (unsigned long)orig_mprotect; */
+	/* __sys_call_table[__NR_mmap]       = (unsigned long)orig_mmap; */
+	/* __sys_call_table[__NR_mremap]     = (unsigned long)orig_mremap; */
 	/* Networking */
 	__sys_call_table[__NR_socket]     = (unsigned long)orig_socket;
 	__sys_call_table[__NR_bind]       = (unsigned long)orig_bind;
@@ -1888,7 +2131,6 @@ static int get_symbol_and_unprot_mem(void)
 	unsigned long start_rodata, init_begin, section_size = 0;
 
 	pr_debug("[vicky] in function get_symbol_and_uprot_mem\n");
-
 
 	__sys_call_table =
 		(unsigned long *)__kallsyms_lookup_name("sys_call_table");
@@ -1927,20 +2169,20 @@ static long rootkit_ioctl(struct file *filp, unsigned int ioctl,
 	pr_debug("[hsuck] %s\n", __FUNCTION__);
 	/* switch (ioctl) { */
 	/* case IOCTL_DISABLE_UNWIND: */
-	/* 	pr_debug("[vicky] Unwind is disabled\n"); */
-	/* 	memset(hook_app, 0, MAX_NAME); */
-	/* 	memset(hook_app2, 0, MAX_NAME); */
-	/* 	memset(hook_app3, 0, MAX_NAME); */
-	/* 	break; */
+	/*	pr_debug("[vicky] Unwind is disabled\n"); */
+	/*	memset(hook_app, 0, MAX_NAME); */
+	/*	memset(hook_app2, 0, MAX_NAME); */
+	/*	memset(hook_app3, 0, MAX_NAME); */
+	/*	break; */
 	/* case IOCTL_ENABLE_UNWIND: */
-	/* 	pr_debug("[vicky] Unwind is enabled\n"); */
-	/* 	strncpy(hook_app, "test1", 5); */
-	/* 	strncpy(hook_app2, "httpd", 5); */
-	/* 	strncpy(hook_app3, "netserver", 9); */
-	/* 	break; */
+	/*	pr_debug("[vicky] Unwind is enabled\n"); */
+	/*	strncpy(hook_app, "test1", 5); */
+	/*	strncpy(hook_app2, "httpd", 5); */
+	/*	strncpy(hook_app3, "netserver", 9); */
+	/*	break; */
 	/* default: */
-	/* 	pr_debug("[vicky] ioctl illegal command\n"); */
-	/* 	break; */
+	/*	pr_debug("[vicky] ioctl illegal command\n"); */
+	/*	break; */
 	/* } */
 	return 0;
 }
@@ -1971,7 +2213,7 @@ static int __init sandbox_init(void)
 	mutex_init(&sandbox_mutex);
 
 	register_kprobe(&kp);
-	__kallsyms_lookup_name = (kallsyms_lookup_name_t) kp.addr;
+	__kallsyms_lookup_name = (kallsyms_lookup_name_t)kp.addr;
 	unregister_kprobe(&kp);
 
 	get_symbol_and_unprot_mem();
@@ -1982,13 +2224,19 @@ static int __init sandbox_init(void)
 	hash_init(proc_htable);
 
 	__find_vma_prev = (void *)__kallsyms_lookup_name("find_vma_prev");
-	__find_get_task_by_vpid = (void *)__kallsyms_lookup_name("find_get_task_by_vpid");
+	__find_get_task_by_vpid =
+		(void *)__kallsyms_lookup_name("find_get_task_by_vpid");
 
 	return 0;
 }
 
 static void __exit sandbox_exit(void)
 {
+	int bkt0, bkt1;
+	struct hash_table *phtable;
+	struct so_info *cur;
+	struct hlist_node *tmp = NULL;
+
 	spin_lock(&sandbox_spinlock);
 	if (syscall_hooked == 1) {
 		__unhook_syscall();
@@ -1996,7 +2244,23 @@ static void __exit sandbox_exit(void)
 	}
 	spin_unlock(&sandbox_spinlock);
 
-	pr_info("[vicky] %s: removed\n", OURMODNAME);
+	hash_for_each (proc_htable, bkt0, phtable, node) {
+		pr_info("[hsuck] (%s, %d)\n", phtable->name, phtable->pid);
+		deinit_unwind_table(&phtable, 1);
+		hash_for_each_safe (phtable->htable, bkt1, tmp, cur, node) {
+			pr_info("[hsuck] (%s)\n", cur->name);
+			hash_del(&cur->node);
+			RELEASE_MEMORY(cur->ehframe);
+			RELEASE_MEMORY(cur->name);
+			kfree(cur);
+		}
+		hash_del(&phtable->node);
+		RELEASE_MEMORY(phtable->name);
+		RELEASE_MEMORY(phtable->cntr);
+		kfree(phtable);
+	}
+
+	pr_debug("[vicky] %s: removed\n", OURMODNAME);
 	misc_deregister(&sandbox);
 }
 

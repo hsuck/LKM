@@ -7,6 +7,7 @@
 #define DEBUG_SANDBOX 0
 #define FIXME_SANDBOX 1
 #define DEBUG_SO_INFO 0
+#define MEASURE_TIME  0
 
 #define TERMINATE_FUNCTION "main"
 
@@ -130,9 +131,10 @@ typedef struct unwind_table {
 	unsigned long size;
 	const unsigned char *header;
 	unsigned long hdrsz;
-	char name[TASK_COMM_LEN];
+	char *name;
 	const struct so_info *info;
 	const void **state_cache; 
+	unsigned int num_caches;
 
 	struct unwind_table *next, *prev;
 } table_t;
@@ -140,8 +142,8 @@ typedef struct unwind_table {
 struct hash_table {
 	pid_t pid;
 	char *name;
-	short is_filled, is_inited, elf_entry_found;
-	unsigned long elf_entry, clone_entry, child_main;
+	short is_filled, is_inited, is_static, elf_entry_found;
+	unsigned long elf_entry, clone_entry, child_main, start;
 	atomic_t *cntr;
 	table_t *root_table;
 	struct hlist_node node;
@@ -173,18 +175,9 @@ struct so_info {
 #define UNW_PC(frame) ((frame)->regs.pc)
 #define UNW_SP(frame) ((frame)->regs.sp)
 
-#define RELEASE_MEMORY(ptr)                 \
-	{                                   \
-		do {                        \
-			if (ptr) {          \
-				kfree(ptr); \
-				ptr = NULL; \
-			}                   \
-		} while (0);                \
-	}
-
+table_t *unwind_add_table(struct hash_table *, const struct so_info *);
 void init_unwind_table(struct hash_table *, struct unwind_frame_info *);
-void deinit_unwind_table(struct hash_table *, int);
+void deinit_unwind_table(struct hash_table **, int);
 int delta_unwind(struct hash_table *, struct unwind_frame_info *);
 int delta_enforce_verification(struct hash_table *, struct unwind_frame_info *);
 #endif
