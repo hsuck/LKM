@@ -211,7 +211,7 @@ static const table_t *find_table(struct hash_table *phtable,
 	table = _find_table(phtable, UNW_PC(frame));
 	if (!table) {
 		do {
-			retval = traverse_vma(UNW_PC(frame));
+			retval = traverse_vma(phtable, UNW_PC(frame));
 		} while (retval == -EAGAIN);
 		phtable->is_inited = 0;
 		init_unwind_table(phtable, frame);
@@ -572,14 +572,14 @@ void deinit_unwind_table(struct hash_table **phtable, int mode)
 		pr_debug("[hsuck] current table=%s\n", tmp->info->name);
 		cur = cur->next;
 		if (mode == 1) {
-			RELEASE_MEMORY(tmp->header);
+			kfree(tmp->header);
 			pr_debug("[hsuck] (%s, %d) cachesz=%u", tmp->info->name,
 				 phtab->pid, tmp->num_caches);
 			for (i = 0; i < tmp->num_caches; ++i)
-				RELEASE_MEMORY(tmp->state_cache[i]);
-			RELEASE_MEMORY(tmp->state_cache);
+				kfree(tmp->state_cache[i]);
+			kfree(tmp->state_cache);
 		}
-		RELEASE_MEMORY(tmp);
+		kfree(tmp);
 	} while (cur && cur != phtab->root_table);
 
 	(*phtable)->root_table = NULL;
@@ -1308,14 +1308,14 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 	if (cie == NULL) {
 		pr_err("[vicky] failed at [%s]: %d, cie is NULL\n",
 		       __FUNCTION__, __LINE__);
-		/* RELEASE_MEMORY(state); */
+		/* kfree(state); */
 		return -EINVAL;
 	}
 
 	if (fde == NULL) {
 		pr_err("[vicky] failed at [%s]: %d, fde is NULL\n",
 		       __FUNCTION__, __LINE__);
-		/* RELEASE_MEMORY(state); */
+		/* kfree(state); */
 		return -EINVAL;
 	}
 	state->org = startLoc;
@@ -1335,7 +1335,7 @@ int delta_unwind(struct hash_table *phtable, struct unwind_frame_info *frame)
 	    reg_info[state->cfa.reg].width != sizeof(unsigned long) ||
 	    state->cfa.offs % sizeof(unsigned long)) {
 		pr_err("[vicky] failed at [%s]: %d\n", __FUNCTION__, __LINE__);
-		/* RELEASE_MEMORY(state); */
+		/* kfree(state); */
 		return -EIO;
 	}
 
@@ -1373,12 +1373,11 @@ unwind:
 	endLoc = max_t(unsigned long, UNW_SP(frame), cfa);
 	pr_debug("[vicky] cfa:%lx; startLoc:%lx; endLoc:%lx\n", cfa, startLoc,
 		 endLoc);
-	/* we are not sure why we need to do the following adjustment
-	if (STACK_LIMIT(startLoc) != STACK_LIMIT(endLoc)) {
-		startLoc = min(STACK_LIMIT(cfa), cfa);
-		endLoc = max(STACK_LIMIT(cfa), cfa);
-	}
-	*/
+	/* we are not sure why we need to do the following adjustment */
+	/* if (STACK_LIMIT(startLoc) != STACK_LIMIT(endLoc)) { */
+	/* 	startLoc = min(STACK_LIMIT(cfa), cfa); */
+	/* 	endLoc = max(STACK_LIMIT(cfa), cfa); */
+	/* } */
 
 	pr_debug("[hsuck] CFA reg: %lx, offset: %lx => %lx\n", state->cfa.reg,
 		 state->cfa.offs, cfa);
@@ -1389,7 +1388,7 @@ unwind:
 				continue;
 			pr_err("[vicky] failed at [%s]: %d\n", __FUNCTION__,
 			       __LINE__);
-			/* RELEASE_MEMORY(state); */
+			/* kfree(state); */
 			return -EIO;
 		}
 
@@ -1403,7 +1402,7 @@ unwind:
 				    reg_info[state->regs[i].value].width) {
 				pr_err("[vicky] failed at [%s]: %d\n",
 				       __FUNCTION__, __LINE__);
-				/* RELEASE_MEMORY(state); */
+				/* kfree(state); */
 				return -EIO;
 			}
 
@@ -1427,7 +1426,7 @@ unwind:
 			default:
 				pr_err("[vicky] failed at [%s]: %d\n",
 				       __FUNCTION__, __LINE__);
-				/* RELEASE_MEMORY(state); */
+				/* kfree(state); */
 				return -EIO;
 			}
 			break;
@@ -1465,7 +1464,7 @@ unwind:
 			default:
 				pr_err("[vicky] failed at [%s]: %d\n",
 				       __FUNCTION__, __LINE__);
-				/* RELEASE_MEMORY(state); */
+				/* kfree(state); */
 				return -EIO;
 			}
 			break;
@@ -1473,7 +1472,7 @@ unwind:
 			if (reg_info[i].width != sizeof(unsigned long)) {
 				pr_err("[vicky] failed at [%s]: %d\n",
 				       __FUNCTION__, __LINE__);
-				/* RELEASE_MEMORY(state); */
+				/* kfree(state); */
 				return -EIO;
 			}
 			FRAME_REG(i, unsigned long) =
@@ -1487,13 +1486,13 @@ unwind:
 			    addr < startLoc ||
 			    addr + sizeof(unsigned long) < addr ||
 			    addr + sizeof(unsigned long) > endLoc) {
-				pr_err("[vicky] failed at [%s]: %d. i = %u, value = %lu,\
-					dataAlign = %ld, addr = %lx, startLoc = %lx,\
-					endLoc = %lx\n",
+				pr_err("[vicky] failed at [%s]: %d. i = %u, value = %lu, "
+				       "dataAlign = %ld, addr = %lx, startLoc = %lx, "
+				       "endLoc = %lx\n",
 				       __FUNCTION__, __LINE__, i,
 				       state->regs[i].value, state->dataAlign,
 				       addr, startLoc, endLoc);
-				/* RELEASE_MEMORY(state); */
+				/* kfree(state); */
 				return -EIO;
 			}
 
@@ -1523,7 +1522,7 @@ unwind:
 		pr_debug("x%d: 0x%lx ", i, *fptr);
 	}
 	UNW_PC(frame) = frame->regs.x30;
-	/* RELEASE_MEMORY(state); */
+	/* kfree(state); */
 	return 0;
 #undef FRAME_REG
 }

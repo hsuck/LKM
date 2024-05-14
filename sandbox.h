@@ -2,6 +2,7 @@
 #define _ASM_SANDBOX_H
 #include <linux/sched.h>
 #include <crypto/hash.h>
+#include "sandbox-unwind.h"
 
 #define RELEASE_MEMORY(ptr)                 \
 	{                                   \
@@ -14,5 +15,5 @@
 	}
 
 int delta_app_inlist(const char *);
-int traverse_vma(unsigned long);
+int traverse_vma(struct hash_table *, unsigned long);
 #endif
