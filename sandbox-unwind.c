@@ -2090,6 +2090,7 @@ int delta_enforce_verification(struct hash_table *phtable,
 	unsigned long prev_pc = 0;
 
 	while (true) {
+		/* UNW_PC(frame) -= 4; */
 		prev_pc = UNW_PC(frame);
 		retval = delta_unwind(phtable, frame);
 		if (retval == -EINVAL || retval == -EIO || retval == -EFAULT) {

@@ -35,7 +35,6 @@
 #define elf_check_fdpic(x) ((x)->e_ident[EI_OSABI] == ELFOSABI_ARM_FDPIC)
 
 #define CLONE_ENTRY 0xea5d0
-#define CHILD_MAIN  0x83ffc
 
 unsigned int num_apps = 10;
 char *hook_apps[] = { "httpd",	  "nginx",     "sqlite-bench", "omnetpp",
@@ -175,7 +174,8 @@ static int open_by_self(struct hash_table *phtable, unsigned long pc)
 		return 1;
 
 	if (pc >= cur->base_address && pc < cur->base_address + cur->pc_range)
-		return -1;
+		return 0;
+
 	return 1;
 }
 
@@ -328,7 +328,7 @@ out:
 	    cur->base_address > phtable->elf_entry)
 		phtable->elf_entry += cur->base_address;
 
-	if (strcmp(phtable->name, cur->name) == 0 &&
+	if (strcmp(phtable->name, cur->name) == 0 && phtable->start &&
 	    cur->base_address > phtable->start)
 		phtable->start += cur->base_address;
 
@@ -603,9 +603,6 @@ static void fill_child_entry(struct hash_table *phtable)
 	struct so_info *item;
 	char libname[128] = "libc.so.6";
 
-	if (phtable->clone_entry && phtable->child_main)
-		return;
-
 	item = search_item(phtable, libname);
 	if (!item) {
 		pr_debug("[hsuck] %s: %s is not found\n", __FUNCTION__,
@@ -623,8 +620,9 @@ static void fill_child_entry(struct hash_table *phtable)
 		return;
 	}
 
-	if (!strcmp("httpd", phtable->name)) {
-		phtable->child_main = item->base_address + CHILD_MAIN;
+	if (!strcmp("httpd", phtable->name) && phtable->child_main &&
+	    item->base_address > phtable->child_main) {
+		phtable->child_main += item->base_address;
 		pr_debug("[hsuck] child_main: %#0lx\n", phtable->child_main);
 	}
 
@@ -633,10 +631,11 @@ static void fill_child_entry(struct hash_table *phtable)
 
 static void syscall_protection(void)
 {
-	int retval;
-	struct pt_regs *regs;
-	struct hash_table *phtable;
 	char *filepath = get_task_full_comm(current);
+	int retval, bkt;
+	struct hash_table *phtable;
+	struct pt_regs *regs;
+	struct so_info *cur;
 
 	pr_debug("[hsuck] task is %s, pid=%d, ppname=%s, ppid=%d\n",
 		 kbasename(filepath), task_pid_nr(current),
@@ -652,10 +651,38 @@ static void syscall_protection(void)
 		goto out;
 	}
 
-	if (phtable->is_static) {
-		pr_debug("[hsuck] static linked\n");
-		goto unwind;
-	}
+	/* if (phtable->is_static) { */
+	/* 	pr_debug("[hsuck] static linked\n"); */
+	/* 	goto unwind; */
+	/* } */
+
+	/* if (!phtable->is_filled) { */
+	/* 	do { */
+	/* 		retval = traverse_vma(phtable, 0); */
+	/* 	} while (retval == -EAGAIN); */
+
+	/* 	phtable->is_filled = 1; */
+	/* } */
+
+	/* if (phtable->is_filled && */
+	/*     (!phtable->clone_entry || !phtable->child_main)) { */
+	/* 	cur = search_item(phtable, "libc.so.6"); */
+	/* 	if (cur) { */
+	/* 		phtable->clone_entry = cur->base_address + CLONE_ENTRY; */
+	/* 		pr_debug("[hsuck] clone entry: %#0lx\n", */
+	/* 			 phtable->clone_entry); */
+	/* 	} */
+
+	/* 	if (!strcmp("httpd", phtable->name)) { */
+	/* 		cur = search_item(phtable, phtable->name); */
+	/* 		if (phtable->child_main && */
+	/* 		    cur->base_address > phtable->child_main) { */
+	/* 			phtable->child_main += cur->base_address; */
+	/* 			pr_debug("[hsuck] child_main: %#0lx\n", */
+	/* 				 phtable->child_main); */
+	/* 		} */
+	/* 	} */
+	/* } */
 
 	switch (is_all_filled(phtable)) {
 	case 0:
@@ -673,6 +700,18 @@ static void syscall_protection(void)
 	}
 
 	regs = task_pt_regs(current);
+	/* cur = search_item(phtable, "ld-linux-aarch64.so.1"); */
+	/* if (cur) */
+	/* 	if (regs->pc < cur->base_address || */
+	/* 	    regs->pc >= cur->base_address + cur->pc_range) */
+	/* 		goto out; */
+
+	/* cur = search_item(phtable, "librtlib.so"); */
+	/* if (cur) */
+	/* 	if (regs->pc < cur->base_address || */
+	/* 	    regs->pc >= cur->base_address + cur->pc_range) */
+	/* 		goto out; */
+
 	switch (open_by_self(phtable, regs->pc)) {
 	case 0:
 		pr_debug("[hsuck] not open by itself\n");
@@ -923,9 +962,7 @@ static void lib_fetch_ehframe(const char *libname, struct file *libfile,
 	struct file *file = libfile;
 	struct so_info *cur;
 	char *buf, *p;
-	char libpath[128] = "/usr/lib/";
-	char rpath[0x100] =
-		"/home/hsuck/PAC-experiment/httpd-2.4.58-vanilla/root/lib/";
+	char *libpath;
 
 	if ((!libname && !libfile) || !phtable)
 		return;
@@ -933,17 +970,39 @@ static void lib_fetch_ehframe(const char *libname, struct file *libfile,
 	if (!libname)
 		goto fetch_ehframe;
 
-	strcat(rpath, libname);
-	file = filp_open(rpath, O_RDONLY | O_LARGEFILE, 0);
-	if (IS_ERR(file)) {
-		pr_debug("[hsuck] open %s failed\n", rpath);
+	libpath = kzalloc(PATH_MAX, GFP_KERNEL);
+	if (!libpath) {
+		pr_err("[hsuck] %s:%d buffer allocation failed\n", __FUNCTION__,
+		       __LINE__);
+		return;
+	}
+	if (phtable->rpath) {
+		strncpy(libpath, phtable->rpath, strlen(phtable->rpath));
+		strcat(libpath, "/");
 		strcat(libpath, libname);
 		file = filp_open(libpath, O_RDONLY | O_LARGEFILE, 0);
 		if (IS_ERR(file)) {
-			pr_err("[hsuck] open %s failed\n", libname);
+			pr_debug("[hsuck] open %s failed\n", libpath);
+			memset(libpath, '\0', PATH_MAX);
+			strcpy(libpath, "/usr/lib/");
+			strcat(libpath, libname);
+			file = filp_open(libpath, O_RDONLY | O_LARGEFILE, 0);
+			if (IS_ERR(file)) {
+				pr_err("[hsuck] open %s failed\n", libpath);
+				return;
+			}
+		}
+	} else {
+		strcpy(libpath, "/usr/lib/");
+		strcat(libpath, libname);
+		file = filp_open(libpath, O_RDONLY | O_LARGEFILE, 0);
+		if (IS_ERR(file)) {
+			pr_err("[hsuck] open %s failed\n", libpath);
 			return;
 		}
 	}
+
+	kfree(libpath);
 
 	/* FIXME hsuck: may need more checking? */
 	if (WARN_ON_ONCE(!S_ISREG(file_inode(file)->i_mode)))
@@ -1001,18 +1060,34 @@ static void elf_get_so(struct elf_shdr *elf_shdynamic, char *dynamic,
 	if (!elf_shdynamic || !dynamic || !strtab || !phtable)
 		return;
 
+	// We need to get rpath before fetching SOs
 	for (i = 0; i < elf_shdynamic->sh_size / elf_shdynamic->sh_entsize;
 	     ++i) {
 		dyn = (Elf64_Dyn *)(dynamic + i * elf_shdynamic->sh_entsize);
 		name = strtab + dyn->d_un.d_val;
-		if (!strlen(name) || dyn->d_tag != DT_NEEDED)
-			goto loop_end;
-
-		pr_debug("[hsuck] %s: %s\n", __FUNCTION__, name);
-		lib_fetch_ehframe(name, NULL, phtable);
-loop_end:
-		dyn = NULL;
+		if (strlen(name) && dyn->d_tag == DT_RPATH && !phtable->rpath) {
+			phtable->rpath = kzalloc(strlen(name) + 1, GFP_KERNEL);
+			if (!phtable->rpath) {
+				pr_err("[hsuck] %s:%d buffer allocation failed\n",
+				       __FUNCTION__, __LINE__);
+				goto out;
+			}
+			strncpy(phtable->rpath, name, strlen(name));
+			pr_info("[hsuck] %s: rpath=%s\n", __FUNCTION__,
+				phtable->rpath);
+		}
 	}
+
+	for (i = 0; i < elf_shdynamic->sh_size / elf_shdynamic->sh_entsize;
+	     ++i) {
+		dyn = (Elf64_Dyn *)(dynamic + i * elf_shdynamic->sh_entsize);
+		name = strtab + dyn->d_un.d_val;
+		if (strlen(name) && dyn->d_tag == DT_NEEDED) {
+			pr_debug("[hsuck] %s: %s\n", __FUNCTION__, name);
+			lib_fetch_ehframe(name, NULL, phtable);
+		}
+	}
+out:
 	return;
 }
 
@@ -1235,7 +1310,7 @@ asmlinkage long hacked_execve_family(const struct pt_regs *pt_regs)
 		pr_err("[ztex] fail to find the symbol of the terminate function," TERMINATE_FUNCTION
 		       "\n");
 		htable->elf_entry_found = 0;
-		goto out_free_tabs;
+		goto fetching_so;
 	}
 	htable->elf_entry_found = 1;
 	htable->elf_entry = sym->st_value;
@@ -1245,17 +1320,28 @@ asmlinkage long hacked_execve_family(const struct pt_regs *pt_regs)
 	sym = elf_get_funcsym(elf_shsymtab, symtab, strtab, "_start");
 	if (!sym) {
 		pr_err("[ztex] fail to find the symbol of the terminate function, _start\n");
-		goto out_free_tabs;
+		htable->start = 0;
+		goto fetching_so;
 	}
 	htable->start = sym->st_value;
 	pr_debug("[ztex] the terminate function (_start) address: 0x%lx\n",
 		 htable->start);
 
-	htable->is_static = elf_ex.e_type != ET_DYN ? 1 : 0;
-	if (!htable->is_static)
-		elf_get_so(elf_shdynamic, dynamic, dynstr, htable);
+	sym = elf_get_funcsym(elf_shsymtab, symtab, strtab, "child_main");
+	if (!sym) {
+		pr_err("[ztex] fail to find the symbol of the terminate function, child_main\n");
+		htable->child_main = 0;
+		goto fetching_so;
+	}
+	htable->child_main = sym->st_value;
+	pr_debug("[ztex] the terminate function (child_main) address: 0x%lx\n",
+		 htable->start);
 
-out_free_tabs:
+fetching_so:
+	htable->is_static = elf_ex.e_type != ET_DYN ? 1 : 0;
+	/* if (!htable->is_static) */
+	elf_get_so(elf_shdynamic, dynamic, dynstr, htable);
+
 	kfree(strtab);
 	kfree(symtab);
 	kfree(dynstr);
@@ -1348,13 +1434,13 @@ asmlinkage long hacked_clone(const struct pt_regs *pt_regs)
 				       __FUNCTION__, __LINE__, cur->name);
 				goto out;
 			}
-			item->eh_frame_size = cur->eh_frame_size;
+			item->eh_frame_size  = cur->eh_frame_size;
 			item->eh_frame_start = cur->eh_frame_start;
 			item->eh_frame_found = cur->eh_frame_found;
-			item->ehframe = cur->ehframe;
-			item->plt_size = cur->plt_size;
-			item->plt_start = cur->plt_start;
-			item->plt_found = cur->plt_found;
+			item->ehframe        = cur->ehframe;
+			item->plt_size       = cur->plt_size;
+			item->plt_start      = cur->plt_start;
+			item->plt_found      = cur->plt_found;
 		}
 
 		if (!pphtable->root_table)
@@ -1397,11 +1483,12 @@ asmlinkage long hacked_clone(const struct pt_regs *pt_regs)
 		}
 
 copy_htable:
-		cphtable->elf_entry = pphtable->elf_entry;
-		cphtable->clone_entry = pphtable->clone_entry;
-		cphtable->child_main = pphtable->child_main;
+		cphtable->rpath           = pphtable->rpath;
+		cphtable->elf_entry       = pphtable->elf_entry;
+		cphtable->clone_entry     = pphtable->clone_entry;
+		cphtable->child_main      = pphtable->child_main;
 		cphtable->elf_entry_found = pphtable->elf_entry_found;
-		cphtable->cntr = pphtable->cntr;
+		cphtable->cntr            = pphtable->cntr;
 
 		/* pr_debug("[hsuck] cntr: %s, %d\n", pphtable->name, */
 		/*	atomic_inc_return(pphtable->cntr)); */
@@ -1498,6 +1585,7 @@ out_free_htable:
 		}
 	hash_del(&phtable->node);
 	kfree(phtable->name);
+	kfree(phtable->rpath);
 	kfree(phtable->cntr);
 	kfree(phtable);
 	(*phtab) = NULL;
@@ -1547,7 +1635,7 @@ asmlinkage long hacked_exit_family(const struct pt_regs *pt_regs)
 	unsigned int syscall_NR = pt_regs->user_regs.regs[8];
 
 	if (delta_app_inlist(current->comm)) {
-		pr_debug("[vicky] syscall `exit(_group)` is hooked, "
+		pr_info("[vicky] syscall `exit(_group)` is hooked, "
 			 "%s(%d)\n",
 			 current->comm, task_pid_nr(current));
 		release_memory();
@@ -1794,6 +1882,7 @@ static void __exit sandbox_exit(void)
 		}
 		hash_del(&phtable->node);
 		kfree(phtable->name);
+		kfree(phtable->rpath);
 		kfree(phtable->cntr);
 		kfree(phtable);
 	}

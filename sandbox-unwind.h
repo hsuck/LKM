@@ -141,7 +141,7 @@ typedef struct unwind_table {
 
 struct hash_table {
 	pid_t pid;
-	char *name;
+	char *name, *rpath;
 	short is_filled, is_inited, is_static, elf_entry_found;
 	unsigned long elf_entry, clone_entry, child_main, start;
 	atomic_t *cntr;
